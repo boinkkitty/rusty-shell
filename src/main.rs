@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn is_builtin(cmd: &str) -> bool {
-    matches!(cmd, "echo" | "exit" | "type")
+    matches!(cmd, "echo" | "exit" | "type" | "pwd" | "cd")
 }
 
 fn find_target(target: &str) -> Option<PathBuf> {
@@ -64,6 +64,30 @@ fn main() {
                             println!("{target} is {}", path.display());
                         } else {
                             println!("{target}: not found");
+                        }
+                    }
+
+                    "pwd" => {
+                        let current_dir = env::current_dir().unwrap();
+
+                        println!("{}", current_dir.display())
+                    }
+
+                    "cd" => {
+                        if parts.len() < 2 {
+                            continue;
+                        }
+
+                        let dir = parts[1];
+
+                        let target = if dir == "~" {
+                            env::var("HOME").unwrap()
+                        } else {
+                            dir.to_string()
+                        };
+
+                        if let Err(_) = env::set_current_dir(&target) {
+                            println!("cd: {}: No such file or directory", dir);
                         }
                     }
 
