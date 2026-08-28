@@ -9,12 +9,18 @@ pub fn run() -> io::Result<()> {
         io::stdout().flush()?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let bytes_read = io::stdin().read_line(&mut input)?;
 
-        let arguments = parse_command_line(&input);
-
-        if matches!(command::execute(&arguments), CommandOutcome::Exit) {
+        if bytes_read == 0 {
             return Ok(());
+        }
+
+        let command = parse_command_line(&input);
+
+        match command::execute(&command) {
+            Ok(CommandOutcome::Exit) => return Ok(()),
+            Ok(CommandOutcome::Continue) => {}
+            Err(error) => eprintln!("shell: {error}"),
         }
     }
 }
