@@ -6,9 +6,27 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use crate::parser::{ParsedCommand, RedirectTarget};
+
+static JOBS: OnceLock<Mutex<Vec<Job>>> = OnceLock::new();
+
+struct Job {
+    number: usize,
+    #[allow(dead_code)]
+    pid: u32,
+    command: String,
+    status: JobStatus,
+    child: Child,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobStatus {
+    Running,
+    Done,
+}
 
 pub enum CommandOutcome {
     Continue,
@@ -44,6 +62,10 @@ pub fn execute(parsed: &ParsedCommand) -> io::Result<CommandOutcome> {
             )?;
             CommandOutcome::Continue
         }
+        "jobs" => {
+            execute_jobs(output_writer(&mut stdout_file, &mut terminal_stdout))?;
+            CommandOutcome::Continue
+        }
         "pwd" => {
             let current_dir = env::current_dir().expect("current directory should be available");
             writeln!(
@@ -62,7 +84,13 @@ pub fn execute(parsed: &ParsedCommand) -> io::Result<CommandOutcome> {
         }
         command => {
             // Every other command is resolved and launched from PATH.
-            return execute_external(command, arguments, stdout_file, stderr_file);
+            return execute_external(
+                command,
+                arguments,
+                stdout_file,
+                stderr_file,
+                parsed.run_in_background,
+            );
         }
     };
 
@@ -95,11 +123,7 @@ fn execute_cd(directory: Option<&str>, error: &mut dyn Write) -> io::Result<()> 
 
     // Expand the home shortcut before changing directories.
     let target = if directory == "~" {
-        let Ok(home) = env::var("HOME") else {
-            writeln!(error, "cd: HOME not set")?;
-            return Ok(());
-        };
-        home
+        env::var("HOME").expect("HOME should be set")
     // Otherwise use the path exactly as entered.
     } else {
         directory.to_owned()
@@ -118,6 +142,7 @@ fn execute_external(
     arguments: &[String],
     stdout_file: Option<File>,
     mut stderr_file: Option<File>,
+    run_in_background: bool,
 ) -> io::Result<CommandOutcome> {
     let Some(path) = find_executable(command) else {
         let mut terminal_stderr = io::stderr();
@@ -131,16 +156,166 @@ fn execute_external(
     let mut process = Command::new(path);
     process.arg0(command).args(arguments);
 
-    // Attach each redirected stream only when requested.
-    if let Some(file) = stdout_file {
-        process.stdout(Stdio::from(file));
-    }
-    if let Some(file) = stderr_file {
-        process.stderr(Stdio::from(file));
+    configure_stdio(&mut process, stdout_file, stderr_file);
+
+    // Background commands start and return control to the shell immediately.
+    if run_in_background {
+        let child = process.spawn()?;
+        let pid = child.id();
+        let job_number = track_job(Job {
+            number: 0,
+            pid,
+            command: display_command(command, arguments),
+            status: JobStatus::Running,
+            child,
+        });
+        println!("[{job_number}] {pid}");
+    } else {
+        process.status()?;
     }
 
-    process.status()?;
     Ok(CommandOutcome::Continue)
+}
+
+fn configure_stdio(process: &mut Command, stdout_file: Option<File>, stderr_file: Option<File>) {
+    // External commands share the shell terminal unless a redirection overrides it.
+    process.stdout(match stdout_file {
+        Some(file) => Stdio::from(file),
+        None => Stdio::inherit(),
+    });
+    process.stderr(match stderr_file {
+        Some(file) => Stdio::from(file),
+        None => Stdio::inherit(),
+    });
+}
+
+fn execute_jobs(output: &mut dyn Write) -> io::Result<()> {
+    reap_completed_jobs(output)?;
+
+    let mut jobs = jobs().lock().expect("job list mutex should not be poisoned");
+
+    for (index, job) in jobs.iter().enumerate() {
+        writeln!(
+            output,
+            "[{}]{}  {:<24}{}",
+            job.number,
+            marker_for(index, jobs.len()),
+            job.status.as_str(),
+            job.display_command()
+        )?;
+    }
+
+    jobs.retain(|job| !job.is_done());
+
+    Ok(())
+}
+
+pub fn reap_completed_jobs(output: &mut dyn Write) -> io::Result<()> {
+    let mut jobs = jobs().lock().expect("job list mutex should not be poisoned");
+    refresh_job_statuses(&mut jobs)?;
+
+    for (index, job) in jobs.iter().enumerate() {
+        if job.is_done() {
+            writeln!(
+                output,
+                "[{}]{}  {:<24}{}",
+                job.number,
+                marker_for(index, jobs.len()),
+                job.status.as_str(),
+                job.display_command()
+            )?;
+        }
+    }
+
+    jobs.retain(|job| !job.is_done());
+
+    Ok(())
+}
+
+fn track_job(mut job: Job) -> usize {
+    let mut jobs = jobs()
+        .lock()
+        .expect("job list mutex should not be poisoned");
+    let number = next_job_number(&jobs);
+    job.number = number;
+    jobs.push(job);
+    number
+}
+
+fn jobs() -> &'static Mutex<Vec<Job>> {
+    JOBS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn display_command(command: &str, arguments: &[String]) -> String {
+    let mut display = String::from(command);
+
+    if !arguments.is_empty() {
+        display.push(' ');
+        display.push_str(&arguments.join(" "));
+    }
+
+    display
+}
+
+fn marker_for(index: usize, total_jobs: usize) -> char {
+    match total_jobs.saturating_sub(index) {
+        1 => '+',
+        2 => '-',
+        _ => ' ',
+    }
+}
+
+fn next_job_number(jobs: &[Job]) -> usize {
+    jobs.iter()
+        .map(|job| job.number)
+        .max()
+        .map_or(1, |highest| highest + 1)
+}
+
+impl JobStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Running => "Running",
+            JobStatus::Done => "Done",
+        }
+    }
+}
+
+impl Job {
+    fn refresh_status(&mut self) -> io::Result<()> {
+        if self.status == JobStatus::Done {
+            return Ok(());
+        }
+
+        if exited_normally(self.child.try_wait()?) {
+            self.status = JobStatus::Done;
+        }
+
+        Ok(())
+    }
+
+    fn display_command(&self) -> String {
+        match self.status {
+            JobStatus::Running => format!("{} &", self.command),
+            JobStatus::Done => self.command.clone(),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(self.status, JobStatus::Done)
+    }
+}
+
+fn refresh_job_statuses(jobs: &mut [Job]) -> io::Result<()> {
+    for job in jobs {
+        job.refresh_status()?;
+    }
+
+    Ok(())
+}
+
+fn exited_normally(status: Option<ExitStatus>) -> bool {
+    matches!(status, Some(exit_status) if exit_status.success() || exit_status.code().is_some())
 }
 
 // Uses the redirected file when present, otherwise the terminal
@@ -174,7 +349,7 @@ fn open_redirection(target: Option<&RedirectTarget>) -> io::Result<Option<File>>
 }
 
 fn is_builtin(command: &str) -> bool {
-    matches!(command, "echo" | "exit" | "type" | "pwd" | "cd")
+    matches!(command, "echo" | "exit" | "type" | "jobs" | "pwd" | "cd")
 }
 
 fn find_executable(target: &str) -> Option<PathBuf> {
@@ -223,8 +398,10 @@ mod tests {
 
     #[test]
     fn finds_executable_prefix_when_path_contains_a_missing_directory() {
-        let directory =
-            env::temp_dir().join(format!("rusty-shell-completion-{}", std::process::id()));
+        let directory = env::temp_dir().join(format!(
+            "codecrafters-shell-completion-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&directory).expect("temporary directory should be created");
 
         let executable = directory.join("custom_executable");
