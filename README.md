@@ -45,6 +45,21 @@ $ printf '<%s>\n' first second
 
 The child process inherits the terminal unless its output is redirected.
 
+## Interactive completion
+
+When `stdin` is a terminal, pressing `Tab` attempts to complete the command name before the first argument.
+
+- A unique match inserts the remaining text and a trailing space.
+- Multiple matches extend to the longest shared prefix when possible.
+- If the prefix is still ambiguous, the first `Tab` rings the terminal bell and a second `Tab` prints the sorted matches.
+
+Completion candidates currently include:
+
+- Built-in commands `echo` and `exit`
+- Executable file names discovered in `PATH`
+
+Completion is limited to the command position. It does not complete arguments, file paths, or later built-ins like `cd`, `pwd`, or `type`.
+
 ## Quoting and escaping
 
 Whitespace separates arguments unless it is quoted or escaped.
@@ -123,8 +138,8 @@ $ echo '>' \> ">>"
 cargo test --locked
 ```
 
-The integration suite covers built-ins, executable lookup, argument parsing, quoting, escaping, and stdout/stderr overwrite and append redirection.
+The test suite covers built-ins, executable lookup, command-name completion, argument parsing, quoting, escaping, EOF handling, `cd ~` without `HOME`, and stdout/stderr overwrite and append redirection.
 
 ## Current scope
 
-This project intentionally implements a focused subset of shell behavior. Pipelines, background jobs, environment-variable expansion, wildcard expansion, command substitution, input redirection, and compound commands are not currently supported.
+This project intentionally implements a focused subset of shell behavior. Pipelines, background jobs, environment-variable expansion, wildcard expansion, command substitution, input redirection, argument/path completion, and compound commands are not currently supported.
