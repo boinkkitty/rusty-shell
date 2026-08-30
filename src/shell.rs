@@ -156,9 +156,8 @@ fn read_input() -> io::Result<Option<String>> {
         return read_terminal_input();
     }
 
-    // Preserve prompt behavior for non-interactive input.
-    print!("$ ");
-    io::stdout().flush()?;
+    let mut stdout = io::stdout().lock();
+    write_prompt(&mut stdout)?;
 
     let mut input = String::new();
     match io::stdin().read_line(&mut input)? {
@@ -170,13 +169,11 @@ fn read_input() -> io::Result<Option<String>> {
 // Handles terminal keys while raw mode is active.
 fn read_terminal_input() -> io::Result<Option<String>> {
     let _raw_mode = RawMode::enable()?;
-    print!("$ ");
-    io::stdout().flush()?;
-
     let mut input = Vec::new();
     let mut byte = [0_u8; 1];
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
+    write_prompt(&mut stdout)?;
     // Tracks whether the previous Tab was pressed at this same ambiguous prefix.
     let mut repeated_prefix = None;
 
@@ -235,6 +232,12 @@ fn read_terminal_input() -> io::Result<Option<String>> {
     }
 }
 
+fn write_prompt(output: &mut dyn Write) -> io::Result<()> {
+    command::reap_completed_jobs(output)?;
+    output.write_all(b"$ ")?;
+    output.flush()
+}
+
 // Runs the shell loop until exit, EOF, or an unrecoverable input error.
 pub fn run() -> io::Result<()> {
     loop {
@@ -268,7 +271,8 @@ mod tests {
     }
 
     fn executable_path(label: &str, names: &[&str]) -> (PathBuf, OsString) {
-        let directory = env::temp_dir().join(format!("rusty-shell-{label}-{}", std::process::id()));
+        let directory =
+            env::temp_dir().join(format!("codecrafters-shell-{label}-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("temporary directory should be created");
 
         for name in names {

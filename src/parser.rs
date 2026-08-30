@@ -29,6 +29,7 @@ pub struct ParsedCommand {
     pub arguments: Vec<String>,
     pub stdout: Option<RedirectTarget>,
     pub stderr: Option<RedirectTarget>,
+    pub run_in_background: bool,
 }
 
 pub fn parse_command_line(input: &str) -> ParsedCommand {
@@ -97,6 +98,15 @@ pub fn parse_command_line(input: &str) -> ParsedCommand {
                 }
                 token_started = true;
             }
+            (QuoteMode::Unquoted, '&')
+                if !token_started
+                    && pending_redirection.is_none()
+                    && characters
+                        .clone()
+                        .all(|character| character.is_whitespace()) =>
+            {
+                command.run_in_background = true;
+            }
             (QuoteMode::Single, '\'') => mode = QuoteMode::Unquoted,
             (QuoteMode::Double, '"') => mode = QuoteMode::Unquoted,
             (QuoteMode::Double, '\\') => {
@@ -152,4 +162,25 @@ fn complete_argument(
     }
 
     *token_started = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_command_line;
+
+    #[test]
+    fn parses_trailing_ampersand_as_background_execution() {
+        let command = parse_command_line("sleep 10 &");
+
+        assert_eq!(command.arguments, vec!["sleep", "10"]);
+        assert!(command.run_in_background);
+    }
+
+    #[test]
+    fn keeps_embedded_ampersands_as_literal_arguments() {
+        let command = parse_command_line("echo a&b '&'");
+
+        assert_eq!(command.arguments, vec!["echo", "a&b", "&"]);
+        assert!(!command.run_in_background);
+    }
 }

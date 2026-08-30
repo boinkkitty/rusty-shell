@@ -29,6 +29,7 @@ $ exit
 | --- | --- | --- |
 | `echo [arguments...]` | Prints its arguments separated by spaces. | `echo hello world` |
 | `type <command>` | Reports whether a command is built in, resolves its executable from `PATH`, or reports that it was not found. | `type cargo` |
+| `jobs` | Lists active background jobs and reports jobs that have completed since the previous check. | `jobs` |
 | `pwd` | Prints the current working directory. | `pwd` |
 | `cd <directory>` | Changes the current working directory. `cd ~` uses `HOME`. | `cd /tmp` |
 | `exit` | Exits the shell. | `exit` |
@@ -59,6 +60,19 @@ Completion candidates currently include:
 - Executable file names discovered in `PATH`
 
 Completion is limited to the command position. It does not complete arguments, file paths, or later built-ins like `cd`, `pwd`, or `type`.
+
+## Background jobs
+
+Append `&` to an external command to run it in the background. The shell prints a job number and process ID, then immediately displays the next prompt:
+
+```text
+$ sleep 10 &
+[1] 12345
+$ jobs
+[1]+  Running                 sleep 10 &
+```
+
+Completed jobs are reported before the next prompt and removed from the job list. Job numbers are reused after completed jobs are reaped.
 
 ## Quoting and escaping
 
@@ -142,4 +156,4 @@ The test suite covers built-ins, executable lookup, command-name completion, arg
 
 ## Current scope
 
-This project intentionally implements a focused subset of shell behavior. Pipelines, background jobs, environment-variable expansion, wildcard expansion, command substitution, input redirection, argument/path completion, and compound commands are not currently supported.
+This project intentionally implements a focused subset of shell behavior. Pipelines, environment-variable expansion, wildcard expansion, command substitution, input redirection, argument/path completion, and compound commands are not currently supported.

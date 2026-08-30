@@ -1,21 +1,19 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct ShellOutput {
     stdout: String,
     stderr: String,
 }
 
-fn shell_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
-}
-
-fn run_shell_output_with(mut command: Command, input: &str) -> ShellOutput {
-    let mut child = command
+fn run_shell_output(input: &str) -> ShellOutput {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -37,22 +35,66 @@ fn run_shell_output_with(mut command: Command, input: &str) -> ShellOutput {
     }
 }
 
-fn run_shell_output(input: &str) -> ShellOutput {
-    run_shell_output_with(shell_command(), input)
-}
-
 fn run_shell(input: &str) -> String {
     run_shell_output(input).stdout
 }
 
+fn read_prompt_line(reader: &mut BufReader<impl std::io::Read>) -> String {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("shell stdout should be readable");
+    line
+}
+
+fn read_prompt(reader: &mut BufReader<impl std::io::Read>) -> String {
+    let mut prompt = [0_u8; 2];
+    reader
+        .read_exact(&mut prompt)
+        .expect("prompt should be readable");
+    String::from_utf8(prompt.to_vec()).expect("prompt should be valid UTF-8")
+}
+
+fn read_until_contains(reader: &mut BufReader<impl std::io::Read>, needle: &str) -> String {
+    let mut output = String::new();
+
+    while !output.contains(needle) {
+        let mut byte = [0_u8; 1];
+        reader
+            .read_exact(&mut byte)
+            .expect("shell output should remain readable");
+        output.push(byte[0] as char);
+    }
+
+    output
+}
+
+fn output_lines(output: &str) -> Vec<&str> {
+    output.lines().collect()
+}
+
 fn temporary_file(name: &str, contents: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("rusty_shell-{}-{name}", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("codecrafters-shell-{}-{name}", std::process::id()));
     fs::write(&path, contents).expect("temporary fixture should be written");
     path
 }
 
 fn temporary_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("rusty_shell-{}-{name}", std::process::id()))
+    std::env::temp_dir().join(format!("codecrafters-shell-{}-{name}", std::process::id()))
+}
+
+fn temporary_fifo(name: &str) -> PathBuf {
+    let path = temporary_path(name);
+    let _ = fs::remove_file(&path);
+
+    let status = Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo should run");
+    assert!(status.success(), "mkfifo should succeed");
+
+    path
 }
 
 #[test]
@@ -80,6 +122,457 @@ fn type_recognizes_builtins() {
         run_shell("type echo\nexit\n"),
         "$ echo is a shell builtin\n$ "
     );
+}
+
+#[test]
+fn type_recognizes_jobs_as_a_builtin() {
+    assert_eq!(
+        run_shell("type jobs\nexit\n"),
+        "$ jobs is a shell builtin\n$ "
+    );
+}
+
+#[test]
+fn jobs_builtin_produces_no_output_when_no_jobs_exist() {
+    assert_eq!(run_shell("jobs\nexit\n"), "$ $ ");
+}
+
+#[test]
+fn jobs_lists_a_single_running_background_job() {
+    let output = run_shell("sleep 10 &\njobs\nexit\n");
+    let lines = output_lines(&output);
+
+    assert_eq!(lines.len(), 3, "unexpected output: {output:?}");
+    assert!(lines[0].starts_with("$ [1] "), "unexpected output: {output:?}");
+    assert_eq!(lines[1], "$ [1]+  Running                 sleep 10 &");
+    assert_eq!(lines[2], "$ ");
+}
+
+#[test]
+fn jobs_lists_multiple_background_jobs_in_start_order_with_markers() {
+    let output = run_shell("sleep 10 &\njobs\nsleep 20 &\njobs\nsleep 30 &\njobs\nexit\n");
+    let lines = output_lines(&output);
+
+    assert_eq!(lines.len(), 10, "unexpected output: {output:?}");
+    assert!(lines[0].starts_with("$ [1] "), "unexpected output: {output:?}");
+    assert_eq!(lines[1], "$ [1]+  Running                 sleep 10 &");
+    assert!(lines[2].starts_with("$ [2] "), "unexpected output: {output:?}");
+    assert_eq!(lines[3], "$ [1]-  Running                 sleep 10 &");
+    assert_eq!(lines[4], "[2]+  Running                 sleep 20 &");
+    assert!(lines[5].starts_with("$ [3] "), "unexpected output: {output:?}");
+    assert_eq!(lines[6], "$ [1]   Running                 sleep 10 &");
+    assert_eq!(lines[7], "[2]-  Running                 sleep 20 &");
+    assert_eq!(lines[8], "[3]+  Running                 sleep 30 &");
+    assert_eq!(lines[9], "$ ");
+}
+
+#[test]
+fn jobs_reports_done_once_and_then_removes_a_completed_background_job() {
+    let fifo = temporary_fifo("single-reap.fifo");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(format!("cat {} &\n", fifo.display()).as_bytes())
+        .expect("background command should be written");
+
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+    let background_job_line = read_prompt_line(&mut stdout);
+    assert!(
+        background_job_line.starts_with("[1] "),
+        "unexpected job line: {background_job_line:?}"
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\n")
+        .expect("jobs command should be written");
+
+    let running_output = read_until_contains(
+        &mut stdout,
+        &format!("Running                 cat {} &\n", fifo.display()),
+    );
+    assert_eq!(
+        running_output,
+        format!("[1]+  Running                 cat {} &\n", fifo.display())
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    fs::write(&fifo, "").expect("fifo should receive EOF");
+    thread::sleep(Duration::from_millis(100));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\n")
+        .expect("jobs command should be written");
+
+    let done_output = read_until_contains(
+        &mut stdout,
+        &format!("Done                    cat {}\n", fifo.display()),
+    );
+    assert_eq!(
+        done_output,
+        format!("[1]+  Done                    cat {}\n", fifo.display())
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\nexit\n")
+        .expect("final commands should be written");
+
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
+
+    fs::remove_file(fifo).expect("fifo should be removed");
+}
+
+#[test]
+fn jobs_reaps_multiple_completed_background_jobs_and_recalculates_markers() {
+    let first_fifo = temporary_fifo("multi-reap-first.fifo");
+    let second_fifo = temporary_fifo("multi-reap-second.fifo");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(
+            format!(
+                "sleep 500 &\ncat {} &\ncat {} &\n",
+                first_fifo.display(),
+                second_fifo.display()
+            )
+            .as_bytes(),
+        )
+        .expect("background commands should be written");
+
+    for expected_job in 1..=3 {
+        assert_eq!(read_prompt(&mut stdout), "$ ");
+        let job_line = read_prompt_line(&mut stdout);
+        assert!(
+            job_line.starts_with(&format!("[{expected_job}] ")),
+            "unexpected job line: {job_line:?}"
+        );
+    }
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    fs::write(&first_fifo, "").expect("first fifo should receive EOF");
+    thread::sleep(Duration::from_millis(100));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\n")
+        .expect("jobs command should be written");
+
+    let first_jobs_output = read_until_contains(
+        &mut stdout,
+        &format!("cat {} &\n", second_fifo.display()),
+    );
+    assert_eq!(
+        first_jobs_output,
+        format!(
+            "[2]-  Done                    cat {}\n[1]-  Running                 sleep 500 &\n[3]+  Running                 cat {} &\n",
+            first_fifo.display(),
+            second_fifo.display()
+        )
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    fs::write(&second_fifo, "").expect("second fifo should receive EOF");
+    thread::sleep(Duration::from_millis(100));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\n")
+        .expect("jobs command should be written");
+
+    let second_jobs_output = read_until_contains(
+        &mut stdout,
+        "Running                 sleep 500 &\n",
+    );
+    assert_eq!(
+        second_jobs_output,
+        format!(
+            "[3]+  Done                    cat {}\n[1]+  Running                 sleep 500 &\n",
+            second_fifo.display()
+        )
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\nexit\n")
+        .expect("final commands should be written");
+
+    let final_jobs_output =
+        read_until_contains(&mut stdout, "Running                 sleep 500 &\n");
+    assert_eq!(final_jobs_output, "[1]+  Running                 sleep 500 &\n");
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
+
+    fs::remove_file(first_fifo).expect("first fifo should be removed");
+    fs::remove_file(second_fifo).expect("second fifo should be removed");
+}
+
+#[test]
+fn completed_jobs_are_reaped_before_the_next_prompt() {
+    let fifo = temporary_fifo("prompt-reap.fifo");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(format!("sleep 500 &\ncat {} &\n", fifo.display()).as_bytes())
+        .expect("background commands should be written");
+
+    for expected_job in 1..=2 {
+        assert_eq!(read_prompt(&mut stdout), "$ ");
+        let job_line = read_prompt_line(&mut stdout);
+        assert!(
+            job_line.starts_with(&format!("[{expected_job}] ")),
+            "unexpected job line: {job_line:?}"
+        );
+    }
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\n")
+        .expect("jobs command should be written");
+
+    let initial_jobs_output = read_until_contains(
+        &mut stdout,
+        &format!("cat {} &\n", fifo.display()),
+    );
+    assert_eq!(
+        initial_jobs_output,
+        format!(
+            "[1]-  Running                 sleep 500 &\n[2]+  Running                 cat {} &\n",
+            fifo.display()
+        )
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    fs::write(&fifo, "").expect("fifo should receive EOF");
+    thread::sleep(Duration::from_millis(100));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"echo banana\n")
+        .expect("echo command should be written");
+
+    let command_and_reap_output = read_until_contains(
+        &mut stdout,
+        &format!("Done                    cat {}\n", fifo.display()),
+    );
+    assert_eq!(
+        command_and_reap_output,
+        format!("banana\n[2]+  Done                    cat {}\n", fifo.display())
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"jobs\nexit\n")
+        .expect("final commands should be written");
+
+    let remaining_jobs_output =
+        read_until_contains(&mut stdout, "Running                 sleep 500 &\n");
+    assert_eq!(remaining_jobs_output, "[1]+  Running                 sleep 500 &\n");
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
+
+    fs::remove_file(fifo).expect("fifo should be removed");
+}
+
+#[test]
+fn job_numbers_recycle_to_one_when_all_jobs_have_been_reaped() {
+    let fifo = temporary_fifo("recycle-empty.fifo");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(format!("cat {} &\n", fifo.display()).as_bytes())
+        .expect("background command should be written");
+
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+    let first_job_line = read_prompt_line(&mut stdout);
+    assert!(
+        first_job_line.starts_with("[1] "),
+        "unexpected job line: {first_job_line:?}"
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    fs::write(&fifo, "").expect("fifo should receive EOF");
+    thread::sleep(Duration::from_millis(100));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"echo apple\n")
+        .expect("echo command should be written");
+
+    let reap_output = read_until_contains(
+        &mut stdout,
+        &format!("Done                    cat {}\n", fifo.display()),
+    );
+    assert_eq!(
+        reap_output,
+        format!("apple\n[1]+  Done                    cat {}\n", fifo.display())
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"sleep 100 &\njobs\nexit\n")
+        .expect("final commands should be written");
+
+    let recycled_job_line = read_prompt_line(&mut stdout);
+    assert!(
+        recycled_job_line.starts_with("[1] "),
+        "unexpected job line: {recycled_job_line:?}"
+    );
+    let recycled_jobs_output =
+        read_until_contains(&mut stdout, "Running                 sleep 100 &\n");
+    assert_eq!(recycled_jobs_output, "$ [1]+  Running                 sleep 100 &\n");
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
+
+    fs::remove_file(fifo).expect("fifo should be removed");
+}
+
+#[test]
+fn job_numbers_reuse_the_highest_completed_slot_when_older_jobs_remain() {
+    let fifo = temporary_fifo("recycle-partial.fifo");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(format!("sleep 100 &\ncat {} &\n", fifo.display()).as_bytes())
+        .expect("background commands should be written");
+
+    for expected_job in 1..=2 {
+        assert_eq!(read_prompt(&mut stdout), "$ ");
+        let job_line = read_prompt_line(&mut stdout);
+        assert!(
+            job_line.starts_with(&format!("[{expected_job}] ")),
+            "unexpected job line: {job_line:?}"
+        );
+    }
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    fs::write(&fifo, "").expect("fifo should receive EOF");
+    thread::sleep(Duration::from_millis(100));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"echo word\n")
+        .expect("echo command should be written");
+
+    let reap_output = read_until_contains(
+        &mut stdout,
+        &format!("Done                    cat {}\n", fifo.display()),
+    );
+    assert_eq!(
+        reap_output,
+        format!("word\n[2]+  Done                    cat {}\n", fifo.display())
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"sleep 50 &\njobs\nexit\n")
+        .expect("final commands should be written");
+
+    let recycled_job_line = read_prompt_line(&mut stdout);
+    assert!(
+        recycled_job_line.starts_with("[2] "),
+        "unexpected job line: {recycled_job_line:?}"
+    );
+    let recycled_jobs_output =
+        read_until_contains(&mut stdout, "Running                 sleep 50 &\n");
+    assert_eq!(
+        recycled_jobs_output,
+        "$ [1]-  Running                 sleep 100 &\n[2]+  Running                 sleep 50 &\n"
+    );
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
+
+    fs::remove_file(fifo).expect("fifo should be removed");
 }
 
 #[test]
@@ -448,35 +941,128 @@ fn quoted_and_escaped_append_operators_remain_literal() {
 }
 
 #[test]
-fn exits_when_standard_input_closes() {
-    let mut child = shell_command()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+fn background_commands_print_job_info_and_return_the_prompt_immediately() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("shell binary should start");
-    let deadline = Instant::now() + Duration::from_millis(500);
 
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("shell status should be available") {
-            assert!(status.success());
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
 
-    child.kill().expect("stuck shell should be terminated");
-    child.wait().expect("terminated shell should be reaped");
-    panic!("shell did not exit when standard input closed");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"sleep 1 &\n")
+        .expect("background command should be written");
+
+    let prompt = read_prompt(&mut stdout);
+    assert_eq!(prompt, "$ ");
+
+    let first_line = read_prompt_line(&mut stdout);
+    assert!(
+        first_line.starts_with("[1] "),
+        "unexpected first line: {first_line:?}"
+    );
+
+    let pid = first_line
+        .trim_end()
+        .split_whitespace()
+        .last()
+        .expect("job line should include a pid")
+        .parse::<u32>()
+        .expect("pid should be numeric");
+
+    assert_eq!(
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("kill should run")
+            .code(),
+        Some(0)
+    );
+
+    let prompt = read_prompt(&mut stdout);
+    assert_eq!(prompt, "$ ");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"exit\n")
+        .expect("exit should be written");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
 }
 
 #[test]
-fn cd_home_reports_an_error_when_home_is_unset() {
-    let mut command = shell_command();
-    command.env_remove("HOME");
+fn background_and_foreground_processes_share_the_shell_terminal_output() {
+    let background_fifo = temporary_fifo("background-output.fifo");
+    let foreground_fifo = temporary_fifo("foreground-output.fifo");
+    let (terminal_reader, terminal_writer) =
+        UnixStream::pair().expect("pseudo terminal stream should be created");
+    let terminal_writer_for_stderr = terminal_writer
+        .try_clone()
+        .expect("writer clone should be created");
+    let stdout_fd: OwnedFd = terminal_writer.into();
+    let stderr_fd: OwnedFd = terminal_writer_for_stderr.into();
 
-    let output = run_shell_output_with(command, "cd ~\nexit\n");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout_fd))
+        .stderr(Stdio::from(stderr_fd))
+        .spawn()
+        .expect("shell binary should start");
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
 
-    assert_eq!(output.stdout, "$ $ ");
-    assert_eq!(output.stderr, "cd: HOME not set\n");
+    stdin
+        .write_all(
+            format!(
+                "cat {} &\ncat {}\n",
+                background_fifo.display(),
+                foreground_fifo.display()
+            )
+            .as_bytes(),
+        )
+        .expect("commands should be written");
+
+    let background_fifo_for_writer = background_fifo.clone();
+    let background_writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        fs::write(&background_fifo_for_writer, "Hello from FIFO#1\n")
+            .expect("background fifo should receive data");
+    });
+
+    let foreground_fifo_for_writer = foreground_fifo.clone();
+    let foreground_writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        fs::write(&foreground_fifo_for_writer, "Hello from FIFO#2\n")
+            .expect("foreground fifo should receive data");
+    });
+
+    let mut reader = BufReader::new(terminal_reader);
+    let mut output = read_until_contains(&mut reader, "Hello from FIFO#1\n");
+    output.push_str(&read_until_contains(&mut reader, "Hello from FIFO#2\n"));
+
+    stdin.write_all(b"exit\n").expect("exit should be written");
+    drop(stdin);
+
+    background_writer
+        .join()
+        .expect("background writer thread should finish");
+    foreground_writer
+        .join()
+        .expect("foreground writer thread should finish");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
+    assert!(output.contains("Hello from FIFO#1\n"));
+    assert!(output.contains("Hello from FIFO#2\n"));
+
+    fs::remove_file(background_fifo).expect("background fifo should be removed");
+    fs::remove_file(foreground_fifo).expect("foreground fifo should be removed");
 }
