@@ -179,8 +179,38 @@ fn type_recognizes_jobs_as_a_builtin() {
 }
 
 #[test]
+fn type_recognizes_history_as_a_builtin() {
+    assert_eq!(
+        run_shell("type history\nexit\n"),
+        "$ history is a shell builtin\n$ "
+    );
+}
+
+#[test]
 fn jobs_builtin_produces_no_output_when_no_jobs_exist() {
     assert_eq!(run_shell("jobs\nexit\n"), "$ $ ");
+}
+
+#[test]
+fn history_lists_previously_executed_commands_in_order() {
+    let output = run_shell_output("echo hello\necho world\ninvalid_command\nhistory\nexit\n");
+
+    assert_eq!(
+        output.stdout,
+        "$ hello\n$ world\n$ $     1  echo hello\n    2  echo world\n    3  invalid_command\n    4  history\n$ "
+    );
+    assert_eq!(output.stderr, "invalid_command: command not found\n");
+}
+
+#[test]
+fn history_with_a_limit_shows_only_the_last_n_commands() {
+    let output = run_shell_output("echo hello\necho world\ninvalid_command\nhistory 2\nexit\n");
+
+    assert_eq!(
+        output.stdout,
+        "$ hello\n$ world\n$ $     3  invalid_command\n    4  history 2\n$ "
+    );
+    assert_eq!(output.stderr, "invalid_command: command not found\n");
 }
 
 #[test]
