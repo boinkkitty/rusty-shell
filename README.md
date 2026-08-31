@@ -33,6 +33,7 @@ Built-ins execute inside the shell process unless they are placed in a pipeline,
 | `type <command>` | Reports whether a command is built in, resolves its executable from `PATH`, or reports that it was not found. | `type cargo` |
 | `jobs` | Lists active background jobs and reports jobs that have completed since the previous check. | `jobs` |
 | `history [count]` | Prints commands recorded during the current session, optionally limited to the most recent count. | `history 10` |
+| `declare [name[=value]...]` | Creates or updates shell variables, or prints their values when given names. | `declare Item=widget` |
 | `pwd` | Prints the current working directory. | `pwd` |
 | `cd <directory>` | Changes the current working directory. `cd ~` uses `HOME`. | `cd /tmp` |
 | `exit` | Exits the shell. | `exit` |
@@ -60,6 +61,16 @@ The shell also launches external programs found through `PATH`, passing parsed a
 **Does not yet mimic:** There is no variable expansion, globbing, command substitution, arithmetic expansion, here-documents, subshell syntax, comments, or full error reporting for unterminated quotes and malformed commands.
 
 **Future work:** Introduce a tokenization and expansion phase before parsing into an execution AST, report syntax locations, and add expansion ordering compatible with POSIX shells.
+
+### Variables and parameter expansion
+
+**Mimics a real shell:** `declare NAME=value` stores a shell variable, and `$NAME` or `${NAME}` expands it in builtin and external-command arguments. Missing variables expand to an empty string, and `$` inside single quotes remains literal.
+
+**Implementation support:** A mutex-protected Rust `HashMap` stores variables. The parser marks single-quoted dollar signs with a private sentinel so expansion can distinguish literal `$` from expandable parameter syntax.
+
+**Does not yet mimic:** Variables are shell-local and are not exported to child processes. There is no positional parameter support, `$?`, command substitution, default-value syntax, special parameters, or expansion field splitting. An argument that expands to an empty string is removed rather than preserved as an empty argument.
+
+**Future work:** Track quote context through an expansion AST, preserve empty fields correctly, implement special and positional parameters, add `export`, and define environment inheritance explicitly.
 
 ### Pipelines
 
@@ -180,8 +191,8 @@ $ echo '>' \> ">>"
 
 ## Project structure
 
-- `src/parser.rs` parses arguments, quoting, escaping, and redirection targets.
-- `src/command.rs` dispatches built-ins and external programs and configures output streams.
+- `src/parser.rs` parses arguments, quoting, escaping, variables, and redirection targets.
+- `src/command.rs` dispatches built-ins and external programs, expands variables, and configures output streams.
 - `src/shell.rs` owns the interactive read-execute loop.
 - `src/repl.rs` configures readline editing and command completion.
 - `tests/shell_cli.rs` exercises the shell through its command-line interface.
@@ -192,8 +203,8 @@ $ echo '>' \> ">>"
 cargo test --locked
 ```
 
-The test suite covers built-ins, executable lookup, command-name completion including unique-completion spacing, session history, pipelines, argument parsing, quoting, escaping, EOF handling, `cd ~` without `HOME`, and stdout/stderr overwrite and append redirection.
+The test suite covers built-ins, executable lookup, command-name completion including unique-completion spacing, session history and persistence, variable declaration and parameter expansion, pipelines, argument parsing, quoting, escaping, EOF handling, `cd ~` without `HOME`, and stdout/stderr overwrite and append redirection.
 
 ## Current scope
 
-This project intentionally implements a focused subset of shell behavior. Environment-variable expansion, wildcard expansion, command substitution, input redirection, argument/path completion, and compound commands are not currently supported.
+This project intentionally implements a focused subset of shell behavior. Wildcard expansion, command substitution, input redirection, argument/path completion, exported variables, and compound commands are not currently supported.

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub(crate) const LITERAL_DOLLAR_MARKER: char = '\u{1f}';
+
 #[derive(Clone, Copy)]
 enum QuoteMode {
     Unquoted,
@@ -139,6 +141,10 @@ pub fn parse_command_line(input: &str) -> ParsedCommand {
                 } else {
                     current.push('\\');
                 }
+                token_started = true;
+            }
+            (QuoteMode::Single, '$') => {
+                current.push(LITERAL_DOLLAR_MARKER);
                 token_started = true;
             }
             (_, character) => {

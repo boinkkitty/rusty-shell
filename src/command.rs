@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
 
-use crate::parser::{CommandStage, ParsedCommand, RedirectTarget};
+use crate::parser::{CommandStage, ParsedCommand, RedirectTarget, LITERAL_DOLLAR_MARKER};
 
 static JOBS: OnceLock<Mutex<Vec<Job>>> = OnceLock::new();
 static HISTORY: OnceLock<Mutex<HistoryState>> = OnceLock::new();
-const BUILTIN_NAMES: &[&str] = &["echo", "exit", "type", "jobs", "history", "pwd", "cd"];
+static VARIABLES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+const BUILTIN_NAMES: &[&str] = &["echo", "exit", "type", "jobs", "history", "pwd", "cd", "declare"];
 
 #[derive(Default)]
 struct HistoryState {
@@ -107,6 +108,7 @@ fn execute_stage(stage: &CommandStage, run_in_background: bool) -> io::Result<Co
     let Some((command, arguments)) = stage.arguments.split_first() else {
         return Ok(CommandOutcome::Continue);
     };
+    let arguments = expand_arguments(arguments);
 
     let mut stdout_file = open_redirection(stage.stdout.as_ref())?;
     let mut stderr_file = open_redirection(stage.stderr.as_ref())?;
@@ -115,7 +117,7 @@ fn execute_stage(stage: &CommandStage, run_in_background: bool) -> io::Result<Co
 
     if let Some(outcome) = execute_builtin(
         command,
-        arguments,
+        &arguments,
         output_writer(&mut stdout_file, &mut terminal_stdout),
         output_writer(&mut stderr_file, &mut terminal_stderr),
         true,
@@ -126,7 +128,7 @@ fn execute_stage(stage: &CommandStage, run_in_background: bool) -> io::Result<Co
     // Every other command is resolved and launched from PATH.
     execute_external(
         command,
-        arguments,
+        &arguments,
         stdout_file,
         stderr_file,
         run_in_background,
@@ -175,6 +177,10 @@ fn execute_builtin(
             execute_cd(arguments.first().map(String::as_str), stderr)?;
             CommandOutcome::Continue
         }
+        "declare" => {
+            execute_declare(arguments, stdout, stderr)?;
+            CommandOutcome::Continue
+        }
         _ => return Ok(None),
     };
 
@@ -221,6 +227,69 @@ fn execute_cd(directory: Option<&str>, error: &mut dyn Write) -> io::Result<()> 
     Ok(())
 }
 
+fn execute_declare(
+    arguments: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    match arguments {
+        [flag, name] if flag == "-p" => {
+            let variables = variables()
+                .lock()
+                .expect("variable mutex should not be poisoned");
+
+            if let Some(value) = variables.get(name) {
+                writeln!(stdout, "declare -- {name}=\"{value}\"")?;
+            } else {
+                writeln!(stderr, "declare: {name}: not found")?;
+            }
+
+            Ok(())
+        }
+        [assignment] => {
+            let Some((name, value)) = split_assignment(assignment) else {
+                return Ok(());
+            };
+
+            if !is_valid_variable_name(name) {
+                writeln!(stderr, "declare: `{assignment}': not a valid identifier")?;
+                return Ok(());
+            }
+
+            variables()
+                .lock()
+                .expect("variable mutex should not be poisoned")
+                .insert(name.to_owned(), value.to_owned());
+
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn split_assignment(argument: &str) -> Option<(&str, &str)> {
+    let (name, value) = argument.split_once('=')?;
+    Some((name, value))
+}
+
+fn is_valid_variable_name(name: &str) -> bool {
+    let mut characters = name.chars();
+
+    let Some(first) = characters.next() else {
+        return false;
+    };
+
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+
+    characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn variables() -> &'static Mutex<HashMap<String, String>> {
+    VARIABLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn execute_external(
     command: &str,
     arguments: &[String],
@@ -259,6 +328,79 @@ fn execute_external(
     }
 
     Ok(CommandOutcome::Continue)
+}
+
+fn expand_arguments(arguments: &[String]) -> Vec<String> {
+    let variables = variables()
+        .lock()
+        .expect("variable mutex should not be poisoned");
+
+    arguments
+        .iter()
+        .filter_map(|argument| {
+            let expanded = expand_argument(argument, &variables);
+            (!expanded.is_empty()).then_some(expanded)
+        })
+        .collect()
+}
+
+fn expand_argument(argument: &str, variables: &HashMap<String, String>) -> String {
+    let mut expanded = String::new();
+    let mut characters = argument.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        if character == LITERAL_DOLLAR_MARKER {
+            expanded.push('$');
+            continue;
+        }
+
+        if character != '$' {
+            expanded.push(character);
+            continue;
+        }
+
+        match characters.peek().copied() {
+            Some('{') => {
+                characters.next();
+                let mut name = String::new();
+
+                while let Some(next) = characters.next() {
+                    if next == '}' {
+                        break;
+                    }
+                    name.push(next);
+                }
+
+                if is_valid_variable_name(&name) {
+                    if let Some(value) = variables.get(&name) {
+                        expanded.push_str(value);
+                    }
+                } else {
+                    expanded.push_str("${");
+                    expanded.push_str(&name);
+                }
+            }
+            Some(next) if next.is_ascii_alphabetic() || next == '_' => {
+                let mut name = String::new();
+
+                while let Some(next) = characters.peek().copied() {
+                    if next.is_ascii_alphanumeric() || next == '_' {
+                        name.push(next);
+                        characters.next();
+                    } else {
+                        break;
+                    }
+                }
+
+                if let Some(value) = variables.get(&name) {
+                    expanded.push_str(value);
+                }
+            }
+            _ => expanded.push('$'),
+        }
+    }
+
+    expanded
 }
 
 fn execute_pipeline(stages: &[CommandStage]) -> io::Result<CommandOutcome> {
@@ -302,6 +444,7 @@ fn spawn_pipeline_stage(
     let Some((command, arguments)) = stage.arguments.split_first() else {
         return Err(io::Error::other("pipeline stage missing command"));
     };
+    let arguments = expand_arguments(arguments);
     let path = if is_builtin(command) {
         env::current_exe()?
     } else {
@@ -311,9 +454,12 @@ fn spawn_pipeline_stage(
 
     let mut process = Command::new(path);
     if is_builtin(command) {
-        process.arg("--pipeline-builtin").arg(command).args(arguments);
+        process
+            .arg("--pipeline-builtin")
+            .arg(command)
+            .args(&arguments);
     } else {
-        process.arg0(command).args(arguments);
+        process.arg0(command).args(&arguments);
     }
 
     configure_pipeline_stdio(&mut process, stage, stdin, pipe_stdout)?;
@@ -677,7 +823,7 @@ mod tests {
     fn exposes_all_shell_builtins_from_a_single_registry() {
         assert_eq!(
             builtin_names(),
-            &["echo", "exit", "type", "jobs", "history", "pwd", "cd"]
+            &["echo", "exit", "type", "jobs", "history", "pwd", "cd", "declare"]
         );
     }
 
