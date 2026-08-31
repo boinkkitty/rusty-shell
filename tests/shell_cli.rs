@@ -215,6 +215,14 @@ fn type_recognizes_history_as_a_builtin() {
 }
 
 #[test]
+fn type_recognizes_declare_as_a_builtin() {
+    assert_eq!(
+        run_shell("type declare\nexit\n"),
+        "$ declare is a shell builtin\n$ "
+    );
+}
+
+#[test]
 fn jobs_builtin_produces_no_output_when_no_jobs_exist() {
     assert_eq!(run_shell("jobs\nexit\n"), "$ $ ");
 }
@@ -354,6 +362,98 @@ fn history_appends_new_session_commands_to_existing_histfile_on_exit() {
     );
 
     fs::remove_file(history_path).expect("temporary history file should be removed");
+}
+
+#[test]
+fn declare_stores_and_prints_a_variable() {
+    let output = run_shell_output("declare foo=bar\ndeclare -p foo\nexit\n");
+
+    assert_eq!(output.stdout, "$ $ declare -- foo=\"bar\"\n$ ");
+    assert_eq!(output.stderr, "");
+}
+
+#[test]
+fn declare_replaces_an_existing_variable_value() {
+    let output =
+        run_shell_output("declare foo=bar\ndeclare foo=updated\ndeclare -p foo\nexit\n");
+
+    assert_eq!(output.stdout, "$ $ $ declare -- foo=\"updated\"\n$ ");
+    assert_eq!(output.stderr, "");
+}
+
+#[test]
+fn declare_reports_missing_variables() {
+    let output = run_shell_output("declare -p missing_variable\nexit\n");
+
+    assert_eq!(output.stdout, "$ $ ");
+    assert_eq!(output.stderr, "declare: missing_variable: not found\n");
+}
+
+#[test]
+fn declare_rejects_invalid_identifiers() {
+    let output = run_shell_output("declare 23=x\nexit\n");
+
+    assert_eq!(output.stdout, "$ $ ");
+    assert_eq!(output.stderr, "declare: `23=x': not a valid identifier\n");
+}
+
+#[test]
+fn declare_accepts_underscores_and_digits_after_the_first_character() {
+    let output = run_shell_output("declare _FOO123=BAR\ndeclare -p _FOO123\nexit\n");
+
+    assert_eq!(output.stdout, "$ $ declare -- _FOO123=\"BAR\"\n$ ");
+    assert_eq!(output.stderr, "");
+}
+
+#[test]
+fn parameter_expansion_replaces_simple_variables_for_builtins() {
+    let output = run_shell_output("declare Item=widget\ndeclare Foo1=Bar2\necho $Item\necho ${Item}_id\necho start_${Item}_end\necho ${Item}and${Foo1}\necho ${missing}world\nexit\n");
+
+    assert_eq!(
+        output.stdout,
+        "$ $ $ widget\n$ widget_id\n$ start_widget_end\n$ widgetandBar2\n$ world\n$ "
+    );
+    assert_eq!(output.stderr, "");
+}
+
+#[test]
+fn parameter_expansion_replaces_variables_for_external_commands() {
+    let script = temporary_executable(
+        "print-args.sh",
+        "#!/usr/bin/env python3\nimport sys\nfor index, argument in enumerate(sys.argv[1:], start=1):\n    print(f'Arg #{index}: {argument}')\n",
+    );
+    let output = run_shell_output(&format!(
+        "declare Variable_1=Value_1\ndeclare Variable_2=Value_2\n{} $Variable_1 $Variable_2\nexit\n",
+        script.display()
+    ));
+
+    assert_eq!(
+        output.stdout,
+        "$ $ $ Arg #1: Value_1\nArg #2: Value_2\n$ "
+    );
+    assert_eq!(output.stderr, "");
+
+    fs::remove_file(script).expect("temporary executable should be removed");
+}
+
+#[test]
+fn parameter_expansion_removes_arguments_that_become_empty() {
+    let script = temporary_executable(
+        "print-args-empty.sh",
+        "#!/usr/bin/env python3\nimport sys\nfor index, argument in enumerate(sys.argv[1:], start=1):\n    print(f'Arg #{index}: {argument}')\n",
+    );
+    let output = run_shell_output(&format!(
+        "declare existing=existingsvalue\n{} ${{missing1}}end ${{existing}} ${{missing2}}\nexit\n",
+        script.display()
+    ));
+
+    assert_eq!(
+        output.stdout,
+        "$ $ Arg #1: end\nArg #2: existingsvalue\n$ "
+    );
+    assert_eq!(output.stderr, "");
+
+    fs::remove_file(script).expect("temporary executable should be removed");
 }
 
 #[test]
