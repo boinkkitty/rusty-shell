@@ -12,6 +12,8 @@ use std::sync::{Mutex, OnceLock};
 use crate::parser::{CommandStage, ParsedCommand, RedirectTarget};
 
 static JOBS: OnceLock<Mutex<Vec<Job>>> = OnceLock::new();
+static HISTORY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+const BUILTIN_NAMES: &[&str] = &["echo", "exit", "type", "jobs", "history", "pwd", "cd"];
 
 struct Job {
     number: usize,
@@ -48,8 +50,28 @@ pub fn run_pipeline_builtin(arguments: Vec<String>) -> io::Result<()> {
 
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
-    let _ = execute_builtin(command, arguments, &mut stdout, &mut stderr, false)?;
+    if let Err(error) = execute_builtin(command, arguments, &mut stdout, &mut stderr, false) {
+        if error.kind() != io::ErrorKind::BrokenPipe {
+            return Err(error);
+        }
+    }
     Ok(())
+}
+
+pub fn record_history(command: &str) {
+    let trimmed = command.trim_end_matches(['\r', '\n']);
+    if trimmed.trim().is_empty() {
+        return;
+    }
+
+    history()
+        .lock()
+        .expect("history mutex should not be poisoned")
+        .push(trimmed.to_owned());
+}
+
+pub fn builtin_names() -> &'static [&'static str] {
+    BUILTIN_NAMES
 }
 
 fn execute_stage(stage: &CommandStage, run_in_background: bool) -> io::Result<CommandOutcome> {
@@ -109,6 +131,10 @@ fn execute_builtin(
         }
         "jobs" => {
             execute_jobs(stdout)?;
+            CommandOutcome::Continue
+        }
+        "history" => {
+            execute_history(arguments, stdout)?;
             CommandOutcome::Continue
         }
         "pwd" => {
@@ -360,6 +386,27 @@ fn jobs() -> &'static Mutex<Vec<Job>> {
     JOBS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn history() -> &'static Mutex<Vec<String>> {
+    HISTORY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn execute_history(arguments: &[String], output: &mut dyn Write) -> io::Result<()> {
+    let history = history()
+        .lock()
+        .expect("history mutex should not be poisoned");
+
+    let start = arguments
+        .first()
+        .and_then(|argument| argument.parse::<usize>().ok())
+        .map_or(0, |count| history.len().saturating_sub(count));
+
+    for (index, command) in history.iter().enumerate().skip(start) {
+        writeln!(output, "{:>5}  {}", index + 1, command)?;
+    }
+
+    Ok(())
+}
+
 fn display_command(command: &str, arguments: &[String]) -> String {
     let mut display = String::from(command);
 
@@ -463,7 +510,7 @@ fn open_redirection(target: Option<&RedirectTarget>) -> io::Result<Option<File>>
 }
 
 fn is_builtin(command: &str) -> bool {
-    matches!(command, "echo" | "exit" | "type" | "jobs" | "pwd" | "cd")
+    builtin_names().contains(&command)
 }
 
 fn find_executable(target: &str) -> Option<PathBuf> {
@@ -496,6 +543,23 @@ pub(crate) fn executable_names(prefix: &str, path: Option<&OsStr>) -> Vec<String
         .collect()
 }
 
+pub(crate) fn completion_candidates(prefix: &str, path: Option<&OsStr>) -> Vec<String> {
+    if prefix.is_empty() || prefix.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+
+    let mut matches: Vec<_> = builtin_names()
+        .iter()
+        .copied()
+        .filter(|builtin| builtin.starts_with(prefix))
+        .map(str::to_owned)
+        .collect();
+    matches.extend(executable_names(prefix, path));
+    matches.sort_unstable();
+    matches.dedup();
+    matches
+}
+
 // Checks that a path is a regular file with at least one execute bit set.
 fn is_executable(path: &Path) -> bool {
     fs::metadata(path)
@@ -508,7 +572,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    use super::executable_names;
+    use super::{builtin_names, completion_candidates, executable_names};
 
     #[test]
     fn finds_executable_prefix_when_path_contains_a_missing_directory() {
@@ -530,6 +594,36 @@ mod tests {
         assert_eq!(
             executable_names("custom", Some(&path)),
             vec!["custom_executable"]
+        );
+
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn exposes_all_shell_builtins_from_a_single_registry() {
+        assert_eq!(
+            builtin_names(),
+            &["echo", "exit", "type", "jobs", "history", "pwd", "cd"]
+        );
+    }
+
+    #[test]
+    fn completion_candidates_include_matching_builtins_and_executables() {
+        let directory = env::temp_dir().join(format!(
+            "codecrafters-shell-completion-candidates-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary directory should be created");
+
+        let executable = directory.join("echo-server");
+        fs::write(&executable, "").expect("temporary executable should be created");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("temporary executable should be executable");
+
+        let path = env::join_paths([directory.clone()]).expect("test PATH should be valid");
+        assert_eq!(
+            completion_candidates("e", Some(&path)),
+            vec!["echo", "echo-server", "exit"]
         );
 
         fs::remove_dir_all(directory).expect("temporary directory should be removed");

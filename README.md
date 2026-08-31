@@ -30,6 +30,7 @@ $ exit
 | `echo [arguments...]` | Prints its arguments separated by spaces. | `echo hello world` |
 | `type <command>` | Reports whether a command is built in, resolves its executable from `PATH`, or reports that it was not found. | `type cargo` |
 | `jobs` | Lists active background jobs and reports jobs that have completed since the previous check. | `jobs` |
+| `history [count]` | Prints commands recorded during the current session, optionally limited to the most recent count. | `history 10` |
 | `pwd` | Prints the current working directory. | `pwd` |
 | `cd <directory>` | Changes the current working directory. `cd ~` uses `HOME`. | `cd /tmp` |
 | `exit` | Exits the shell. | `exit` |
@@ -73,6 +74,12 @@ Completion candidates currently include:
 - Executable file names discovered in `PATH`
 
 Completion is limited to the command position. It does not complete arguments, file paths, or later built-ins like `cd`, `pwd`, or `type`.
+
+Unique completions insert a trailing space so the next token can be typed immediately. Ambiguous completion candidates are inserted without a trailing space, allowing the completion list to continue narrowing correctly.
+
+The interactive editor is implemented with `rustyline`, which centralizes terminal input, completion, history handling, and line editing instead of maintaining a separate raw-terminal reader.
+
+Command history is also recorded in memory and can be inspected with `history`. Interactive line editing maintains its own readline history for navigation and completion.
 
 ## Background jobs
 
@@ -157,6 +164,7 @@ $ echo '>' \> ">>"
 - `src/parser.rs` parses arguments, quoting, escaping, and redirection targets.
 - `src/command.rs` dispatches built-ins and external programs and configures output streams.
 - `src/shell.rs` owns the interactive read-execute loop.
+- `src/repl.rs` configures readline editing and command completion.
 - `tests/shell_cli.rs` exercises the shell through its command-line interface.
 
 ## Test
@@ -165,7 +173,7 @@ $ echo '>' \> ">>"
 cargo test --locked
 ```
 
-The test suite covers built-ins, executable lookup, command-name completion, pipelines, argument parsing, quoting, escaping, EOF handling, `cd ~` without `HOME`, and stdout/stderr overwrite and append redirection.
+The test suite covers built-ins, executable lookup, command-name completion including unique-completion spacing, session history, pipelines, argument parsing, quoting, escaping, EOF handling, `cd ~` without `HOME`, and stdout/stderr overwrite and append redirection.
 
 ## Current scope
 
