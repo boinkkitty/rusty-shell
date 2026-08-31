@@ -1,12 +1,14 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+#[derive(Debug)]
 struct ShellOutput {
     stdout: String,
     stderr: String,
@@ -37,6 +39,43 @@ fn run_shell_output(input: &str) -> ShellOutput {
 
 fn run_shell(input: &str) -> String {
     run_shell_output(input).stdout
+}
+
+fn run_shell_output_with_path(input: &str, path: &str) -> ShellOutput {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(input.as_bytes())
+        .expect("test input should be written");
+
+    let output = child.wait_with_output().expect("shell should exit");
+    assert!(output.status.success());
+    ShellOutput {
+        stdout: String::from_utf8(output.stdout).expect("shell stdout should be UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("shell stderr should be UTF-8"),
+    }
+}
+
+fn temporary_bin(name: &str, mappings: &[(&str, &str)]) -> PathBuf {
+    let directory = temporary_path(name);
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).expect("temporary bin directory should be created");
+
+    for (link_name, target) in mappings {
+        std::os::unix::fs::symlink(target, directory.join(link_name))
+            .expect("temporary symlink should be created");
+    }
+
+    directory
 }
 
 fn read_prompt_line(reader: &mut BufReader<impl std::io::Read>) -> String {
@@ -94,6 +133,13 @@ fn temporary_fifo(name: &str) -> PathBuf {
         .expect("mkfifo should run");
     assert!(status.success(), "mkfifo should succeed");
 
+    path
+}
+
+fn temporary_executable(name: &str, contents: &str) -> PathBuf {
+    let path = temporary_file(name, contents);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("temporary executable should be executable");
     path
 }
 
@@ -297,7 +343,7 @@ fn jobs_reaps_multiple_completed_background_jobs_and_recalculates_markers() {
     assert_eq!(
         first_jobs_output,
         format!(
-            "[2]-  Done                    cat {}\n[1]-  Running                 sleep 500 &\n[3]+  Running                 cat {} &\n",
+            "[1]   Running                 sleep 500 &\n[2]-  Done                    cat {}\n[3]+  Running                 cat {} &\n",
             first_fifo.display(),
             second_fifo.display()
         )
@@ -316,12 +362,12 @@ fn jobs_reaps_multiple_completed_background_jobs_and_recalculates_markers() {
 
     let second_jobs_output = read_until_contains(
         &mut stdout,
-        "Running                 sleep 500 &\n",
+        &format!("Done                    cat {}\n", second_fifo.display()),
     );
     assert_eq!(
         second_jobs_output,
         format!(
-            "[3]+  Done                    cat {}\n[1]+  Running                 sleep 500 &\n",
+            "[1]-  Running                 sleep 500 &\n[3]+  Done                    cat {}\n",
             second_fifo.display()
         )
     );
@@ -684,6 +730,208 @@ fn cat_receives_escaped_quotes_and_backslashes_from_double_quotes() {
 
     fs::remove_file(quote_path).expect("temporary fixture should be removed");
     fs::remove_file(slash_path).expect("temporary fixture should be removed");
+}
+
+#[test]
+fn pipelines_connect_stdout_of_one_external_command_to_stdin_of_another() {
+    let input_path = temporary_file("pipeline-source", "apple\nbanana\ncarrot\ndate\neggplant\n");
+    let output = run_shell(&format!("cat {} | wc\nexit\n", input_path.display()));
+
+    assert!(output.starts_with("$ "), "unexpected output: {output:?}");
+    assert!(output.ends_with("$ "), "unexpected output: {output:?}");
+    assert!(output.contains("5"), "unexpected output: {output:?}");
+    assert!(output.contains("apple") == false, "unexpected output: {output:?}");
+
+    fs::remove_file(input_path).expect("temporary fixture should be removed");
+}
+
+#[test]
+fn pipelines_chain_three_external_commands() {
+    let input_path = temporary_file("pipeline-three-source", "a\nbb\ncccc\ndddd\neeeee\n");
+    let output = run_shell(&format!(
+        "cat {} | head -n 3 | wc\nexit\n",
+        input_path.display()
+    ));
+
+    assert!(output.starts_with("$ "), "unexpected output: {output:?}");
+    assert!(output.ends_with("$ "), "unexpected output: {output:?}");
+    assert!(output.contains("3"), "unexpected output: {output:?}");
+    assert!(output.contains("10"), "unexpected output: {output:?}");
+    assert!(!output.contains("apple"), "unexpected output: {output:?}");
+
+    fs::remove_file(input_path).expect("temporary fixture should be removed");
+}
+
+#[test]
+fn pipelines_chain_four_external_commands() {
+    let directory = temporary_path("pipeline-four-dir");
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).expect("temporary directory should be created");
+    fs::write(directory.join("file"), "apple").expect("fixture file should be written");
+    fs::write(directory.join("file-two"), "banana").expect("fixture file should be written");
+    fs::write(directory.join("note"), "pear").expect("fixture file should be written");
+
+    let output = run_shell(&format!(
+        "ls -la {} | tail -n 5 | head -n 3 | grep \"file\"\nexit\n",
+        directory.display()
+    ));
+
+    assert!(output.starts_with("$ "), "unexpected output: {output:?}");
+    assert!(output.ends_with("$ "), "unexpected output: {output:?}");
+    assert!(output.contains("file"), "unexpected output: {output:?}");
+    assert!(!output.contains("note"), "unexpected output: {output:?}");
+
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn pipelines_connect_builtin_stdout_to_external_stdin() {
+    let bin = temporary_bin("pipeline-builtin-left-bin", &[("wc", "/usr/bin/wc")]);
+    let output = run_shell_output_with_path("echo apple-orange | wc\nexit\n", &bin.display().to_string());
+
+    assert!(output.stdout.starts_with("$ "), "unexpected output: {output:?}");
+    assert!(output.stdout.ends_with("$ "), "unexpected output: {output:?}");
+    assert!(output.stdout.contains("1"), "unexpected output: {output:?}");
+    assert!(output.stdout.contains("13"), "unexpected output: {output:?}");
+    assert!(
+        !output.stdout.contains("apple-orange"),
+        "unexpected output: {output:?}"
+    );
+    assert_eq!(output.stderr, "");
+
+    fs::remove_dir_all(bin).expect("temporary bin directory should be removed");
+}
+
+#[test]
+fn pipelines_allow_builtins_in_middle_stages() {
+    let bin = temporary_bin("pipeline-builtin-middle-bin", &[("wc", "/usr/bin/wc")]);
+    let output = run_shell_output_with_path(
+        "echo apple-orange | type exit | wc\nexit\n",
+        &bin.display().to_string(),
+    );
+
+    assert!(output.stdout.starts_with("$ "), "unexpected output: {output:?}");
+    assert!(output.stdout.ends_with("$ "), "unexpected output: {output:?}");
+    assert!(
+        output.stdout.contains("1"),
+        "unexpected output: {output:?}"
+    );
+    assert!(
+        output.stdout.contains("24"),
+        "unexpected output: {output:?}"
+    );
+    assert_eq!(output.stderr, "");
+
+    fs::remove_dir_all(bin).expect("temporary bin directory should be removed");
+}
+
+#[test]
+fn pipelines_allow_builtins_to_consume_pipeline_position_without_printing_upstream_output() {
+    let bin = temporary_bin("pipeline-builtin-right-bin", &[("ls", "/bin/ls")]);
+    let output = run_shell_output_with_path("ls | type exit\nexit\n", &bin.display().to_string());
+
+    assert_eq!(output.stdout, "$ exit is a shell builtin\n$ ");
+    assert_eq!(output.stderr, "");
+
+    fs::remove_dir_all(bin).expect("temporary bin directory should be removed");
+}
+
+#[test]
+fn pipelines_keep_streaming_until_the_downstream_command_finishes() {
+    let fifo = temporary_fifo("pipeline-stream.fifo");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(format!("cat {} | head -n 5\n", fifo.display()).as_bytes())
+        .expect("pipeline should be written");
+
+    let fifo_for_writer = fifo.clone();
+    let append_thread = thread::spawn(move || {
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo_for_writer)
+            .expect("stream fifo should be opened for writing");
+        writer
+            .write_all(b"raspberry strawberry\npear mango\npineapple apple\n")
+            .expect("initial stream lines should be written");
+        thread::sleep(Duration::from_millis(100));
+        writer
+            .write_all(b"This is line 4.\nThis is line 5.\n")
+            .expect("appended stream lines should be written");
+    });
+
+    let initial_output = read_until_contains(&mut stdout, "pineapple apple\n");
+    assert_eq!(
+        initial_output,
+        "$ raspberry strawberry\npear mango\npineapple apple\n"
+    );
+
+    let appended_output = read_until_contains(&mut stdout, "This is line 5.\n");
+    assert_eq!(appended_output, "This is line 4.\nThis is line 5.\n");
+    assert_eq!(read_prompt(&mut stdout), "$ ");
+
+    append_thread
+        .join()
+        .expect("append thread should complete successfully");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"exit\n")
+        .expect("exit should be written");
+
+    let status = child.wait().expect("shell should exit");
+    assert!(status.success());
+
+    fs::remove_file(fifo).expect("temporary fifo should be removed");
+}
+
+#[test]
+fn pipelines_let_the_upstream_process_exit_naturally_after_downstream_completion() {
+    let script = temporary_executable(
+        "pipeline-natural-exit.sh",
+        "#!/usr/bin/env python3\nimport os\nimport sys\n\nmarker = os.environ['MARKER']\ntry:\n    while True:\n        sys.stdout.write('line\\n')\n        sys.stdout.flush()\nexcept BrokenPipeError:\n    with open(marker, 'w', encoding='utf-8') as handle:\n        handle.write('PIPE\\n')\n    os._exit(0)\n",
+    );
+    let marker = temporary_path("pipeline-natural-exit.marker");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"))
+        .env("MARKER", &marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("shell binary should start");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(format!("{} | head -n 5\nexit\n", script.display()).as_bytes())
+        .expect("pipeline should be written");
+    let output = child.wait_with_output().expect("shell should exit");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("shell stderr should be UTF-8"),
+        ""
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).expect("marker should be written"),
+        "PIPE\n"
+    );
+
+    fs::remove_file(script).expect("temporary executable should be removed");
+    fs::remove_file(marker).expect("marker should be removed");
 }
 
 #[test]

@@ -25,15 +25,21 @@ pub struct RedirectTarget {
 }
 
 #[derive(Default)]
-pub struct ParsedCommand {
+pub struct CommandStage {
     pub arguments: Vec<String>,
     pub stdout: Option<RedirectTarget>,
     pub stderr: Option<RedirectTarget>,
+}
+
+#[derive(Default)]
+pub struct ParsedCommand {
+    pub stages: Vec<CommandStage>,
     pub run_in_background: bool,
 }
 
 pub fn parse_command_line(input: &str) -> ParsedCommand {
     let mut command = ParsedCommand::default(); // Parsed command result
+    let mut stage = CommandStage::default(); // Current pipeline stage
     let mut current = String::new(); // Argument being built
     let mut token_started = false; // Preserves empty quotes
     let mut mode = QuoteMode::Unquoted; // Current quoting context
@@ -45,7 +51,7 @@ pub fn parse_command_line(input: &str) -> ParsedCommand {
         match (mode, character) {
             (QuoteMode::Unquoted, character) if character.is_whitespace() => {
                 complete_argument(
-                    &mut command,
+                    &mut stage,
                     &mut current,
                     &mut token_started,
                     &mut pending_redirection,
@@ -54,6 +60,12 @@ pub fn parse_command_line(input: &str) -> ParsedCommand {
             (QuoteMode::Unquoted, descriptor @ ('1' | '2'))
                 if !token_started && matches!(characters.peek(), Some('>')) =>
             {
+                complete_argument(
+                    &mut stage,
+                    &mut current,
+                    &mut token_started,
+                    &mut pending_redirection,
+                );
                 characters.next();
                 let append = matches!(characters.peek(), Some('>'));
                 if append {
@@ -70,7 +82,7 @@ pub fn parse_command_line(input: &str) -> ParsedCommand {
             }
             (QuoteMode::Unquoted, '>') => {
                 complete_argument(
-                    &mut command,
+                    &mut stage,
                     &mut current,
                     &mut token_started,
                     &mut pending_redirection,
@@ -83,6 +95,18 @@ pub fn parse_command_line(input: &str) -> ParsedCommand {
                     stream: RedirectStream::Stdout,
                     append,
                 });
+            }
+            (QuoteMode::Unquoted, '|') => {
+                complete_argument(
+                    &mut stage,
+                    &mut current,
+                    &mut token_started,
+                    &mut pending_redirection,
+                );
+                if !stage.arguments.is_empty() {
+                    command.stages.push(stage);
+                    stage = CommandStage::default();
+                }
             }
             (QuoteMode::Unquoted, '\'') => {
                 mode = QuoteMode::Single;
@@ -125,17 +149,20 @@ pub fn parse_command_line(input: &str) -> ParsedCommand {
     }
 
     complete_argument(
-        &mut command,
+        &mut stage,
         &mut current,
         &mut token_started,
         &mut pending_redirection,
     );
+    if !stage.arguments.is_empty() {
+        command.stages.push(stage);
+    }
 
     command
 }
 
 fn complete_argument(
-    command: &mut ParsedCommand,
+    stage: &mut CommandStage,
     current: &mut String,
     token_started: &mut bool,
     pending_redirection: &mut Option<PendingRedirection>,
@@ -154,11 +181,11 @@ fn complete_argument(
             };
 
             match redirection.stream {
-                RedirectStream::Stdout => command.stdout = Some(target),
-                RedirectStream::Stderr => command.stderr = Some(target),
+                RedirectStream::Stdout => stage.stdout = Some(target),
+                RedirectStream::Stderr => stage.stderr = Some(target),
             }
         }
-        None => command.arguments.push(argument),
+        None => stage.arguments.push(argument),
     }
 
     *token_started = false;
@@ -172,7 +199,8 @@ mod tests {
     fn parses_trailing_ampersand_as_background_execution() {
         let command = parse_command_line("sleep 10 &");
 
-        assert_eq!(command.arguments, vec!["sleep", "10"]);
+        assert_eq!(command.stages.len(), 1);
+        assert_eq!(command.stages[0].arguments, vec!["sleep", "10"]);
         assert!(command.run_in_background);
     }
 
@@ -180,7 +208,17 @@ mod tests {
     fn keeps_embedded_ampersands_as_literal_arguments() {
         let command = parse_command_line("echo a&b '&'");
 
-        assert_eq!(command.arguments, vec!["echo", "a&b", "&"]);
+        assert_eq!(command.stages.len(), 1);
+        assert_eq!(command.stages[0].arguments, vec!["echo", "a&b", "&"]);
         assert!(!command.run_in_background);
+    }
+
+    #[test]
+    fn parses_unquoted_pipes_into_multiple_stages() {
+        let command = parse_command_line("cat file | wc");
+
+        assert_eq!(command.stages.len(), 2);
+        assert_eq!(command.stages[0].arguments, vec!["cat", "file"]);
+        assert_eq!(command.stages[1].arguments, vec!["wc"]);
     }
 }

@@ -46,6 +46,19 @@ $ printf '<%s>\n' first second
 
 The child process inherits the terminal unless its output is redirected.
 
+## Pipelines
+
+Use `|` to connect the standard output of one command to the standard input of the next. Pipelines may contain any number of stages, and built-ins can participate in any stage:
+
+```text
+$ cat output.txt | grep second | wc -l
+1
+$ echo hello | type exit
+exit is a shell builtin
+```
+
+Pipeline built-ins run in an isolated shell process, so state-changing commands in a pipeline do not affect the parent shell.
+
 ## Interactive completion
 
 When `stdin` is a terminal, pressing `Tab` attempts to complete the command name before the first argument.
@@ -152,8 +165,8 @@ $ echo '>' \> ">>"
 cargo test --locked
 ```
 
-The test suite covers built-ins, executable lookup, command-name completion, argument parsing, quoting, escaping, EOF handling, `cd ~` without `HOME`, and stdout/stderr overwrite and append redirection.
+The test suite covers built-ins, executable lookup, command-name completion, pipelines, argument parsing, quoting, escaping, EOF handling, `cd ~` without `HOME`, and stdout/stderr overwrite and append redirection.
 
 ## Current scope
 
-This project intentionally implements a focused subset of shell behavior. Pipelines, environment-variable expansion, wildcard expansion, command substitution, input redirection, argument/path completion, and compound commands are not currently supported.
+This project intentionally implements a focused subset of shell behavior. Environment-variable expansion, wildcard expansion, command substitution, input redirection, argument/path completion, and compound commands are not currently supported.
