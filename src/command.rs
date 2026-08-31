@@ -6,10 +6,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
 
-use crate::parser::{ParsedCommand, RedirectTarget};
+use crate::parser::{CommandStage, ParsedCommand, RedirectTarget};
 
 static JOBS: OnceLock<Mutex<Vec<Job>>> = OnceLock::new();
 
@@ -34,67 +34,96 @@ pub enum CommandOutcome {
 }
 
 pub fn execute(parsed: &ParsedCommand) -> io::Result<CommandOutcome> {
-    let Some((command, arguments)) = parsed.arguments.split_first() else {
+    match parsed.stages.as_slice() {
+        [] => Ok(CommandOutcome::Continue),
+        [stage] => execute_stage(stage, parsed.run_in_background),
+        stages => execute_pipeline(stages),
+    }
+}
+
+pub fn run_pipeline_builtin(arguments: Vec<String>) -> io::Result<()> {
+    let Some((command, arguments)) = arguments.split_first() else {
+        return Ok(());
+    };
+
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    let _ = execute_builtin(command, arguments, &mut stdout, &mut stderr, false)?;
+    Ok(())
+}
+
+fn execute_stage(stage: &CommandStage, run_in_background: bool) -> io::Result<CommandOutcome> {
+    let Some((command, arguments)) = stage.arguments.split_first() else {
         return Ok(CommandOutcome::Continue);
     };
 
-    let mut stdout_file = open_redirection(parsed.stdout.as_ref())?;
-    let mut stderr_file = open_redirection(parsed.stderr.as_ref())?;
+    let mut stdout_file = open_redirection(stage.stdout.as_ref())?;
+    let mut stderr_file = open_redirection(stage.stderr.as_ref())?;
     let mut terminal_stdout = io::stdout();
     let mut terminal_stderr = io::stderr();
 
-    let outcome = match command.as_str() {
+    if let Some(outcome) = execute_builtin(
+        command,
+        arguments,
+        output_writer(&mut stdout_file, &mut terminal_stdout),
+        output_writer(&mut stderr_file, &mut terminal_stderr),
+        true,
+    )? {
+        return Ok(outcome);
+    }
+
+    // Every other command is resolved and launched from PATH.
+    execute_external(
+        command,
+        arguments,
+        stdout_file,
+        stderr_file,
+        run_in_background,
+    )
+}
+
+fn execute_builtin(
+    command: &str,
+    arguments: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    exit_shell: bool,
+) -> io::Result<Option<CommandOutcome>> {
+    let outcome = match command {
         // Exit is handled by the shell loop instead of an external process.
-        "exit" => CommandOutcome::Exit,
+        "exit" => {
+            if exit_shell {
+                CommandOutcome::Exit
+            } else {
+                CommandOutcome::Continue
+            }
+        }
         // Builtins write through the selected stdout/stderr destination.
         "echo" => {
-            writeln!(
-                output_writer(&mut stdout_file, &mut terminal_stdout),
-                "{}",
-                arguments.join(" ")
-            )?;
+            writeln!(stdout, "{}", arguments.join(" "))?;
             CommandOutcome::Continue
         }
         "type" => {
-            execute_type(
-                arguments.first().map(String::as_str),
-                output_writer(&mut stdout_file, &mut terminal_stdout),
-            )?;
+            execute_type(arguments.first().map(String::as_str), stdout)?;
             CommandOutcome::Continue
         }
         "jobs" => {
-            execute_jobs(output_writer(&mut stdout_file, &mut terminal_stdout))?;
+            execute_jobs(stdout)?;
             CommandOutcome::Continue
         }
         "pwd" => {
             let current_dir = env::current_dir().expect("current directory should be available");
-            writeln!(
-                output_writer(&mut stdout_file, &mut terminal_stdout),
-                "{}",
-                current_dir.display()
-            )?;
+            writeln!(stdout, "{}", current_dir.display())?;
             CommandOutcome::Continue
         }
         "cd" => {
-            execute_cd(
-                arguments.first().map(String::as_str),
-                output_writer(&mut stderr_file, &mut terminal_stderr),
-            )?;
+            execute_cd(arguments.first().map(String::as_str), stderr)?;
             CommandOutcome::Continue
         }
-        command => {
-            // Every other command is resolved and launched from PATH.
-            return execute_external(
-                command,
-                arguments,
-                stdout_file,
-                stderr_file,
-                parsed.run_in_background,
-            );
-        }
+        _ => return Ok(None),
     };
 
-    Ok(outcome)
+    Ok(Some(outcome))
 }
 
 fn execute_type(target: Option<&str>, output: &mut dyn Write) -> io::Result<()> {
@@ -177,6 +206,92 @@ fn execute_external(
     Ok(CommandOutcome::Continue)
 }
 
+fn execute_pipeline(stages: &[CommandStage]) -> io::Result<CommandOutcome> {
+    if stages.iter().any(|stage| stage.arguments.is_empty()) {
+        return Ok(CommandOutcome::Continue);
+    }
+
+    let mut children = Vec::with_capacity(stages.len());
+    let mut previous_stdout = None;
+
+    for (index, stage) in stages.iter().enumerate() {
+        let pipe_stdout = index + 1 < stages.len();
+        let mut child = spawn_pipeline_stage(stage, previous_stdout.take(), pipe_stdout)?;
+
+        previous_stdout = if pipe_stdout {
+            Some(
+                child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| io::Error::other("pipeline stage missing stdout"))?,
+            )
+        } else {
+            None
+        };
+
+        children.push(child);
+    }
+
+    for mut child in children.into_iter().rev() {
+        child.wait()?;
+    }
+
+    Ok(CommandOutcome::Continue)
+}
+
+fn spawn_pipeline_stage(
+    stage: &CommandStage,
+    stdin: Option<ChildStdout>,
+    pipe_stdout: bool,
+) -> io::Result<Child> {
+    let Some((command, arguments)) = stage.arguments.split_first() else {
+        return Err(io::Error::other("pipeline stage missing command"));
+    };
+    let path = if is_builtin(command) {
+        env::current_exe()?
+    } else {
+        find_executable(command)
+            .ok_or_else(|| io::Error::other(format!("{command}: command not found")))?
+    };
+
+    let mut process = Command::new(path);
+    if is_builtin(command) {
+        process.arg("--pipeline-builtin").arg(command).args(arguments);
+    } else {
+        process.arg0(command).args(arguments);
+    }
+
+    configure_pipeline_stdio(&mut process, stage, stdin, pipe_stdout)?;
+    process.spawn()
+}
+
+fn configure_pipeline_stdio(
+    process: &mut Command,
+    stage: &CommandStage,
+    stdin: Option<ChildStdout>,
+    pipe_stdout: bool,
+) -> io::Result<()> {
+    if let Some(source) = stdin {
+        process.stdin(Stdio::from(source));
+    }
+
+    if pipe_stdout {
+        process.stdout(Stdio::piped());
+    } else if let Some(file) = open_redirection(stage.stdout.as_ref())? {
+        process.stdout(Stdio::from(file));
+    } else {
+        process.stdout(Stdio::inherit());
+    }
+
+    if let Some(file) = open_redirection(stage.stderr.as_ref())? {
+        process.stderr(Stdio::from(file));
+    } else {
+        process.stderr(Stdio::inherit());
+    }
+
+    Ok(())
+}
+
 fn configure_stdio(process: &mut Command, stdout_file: Option<File>, stderr_file: Option<File>) {
     // External commands share the shell terminal unless a redirection overrides it.
     process.stdout(match stdout_file {
@@ -190,9 +305,8 @@ fn configure_stdio(process: &mut Command, stdout_file: Option<File>, stderr_file
 }
 
 fn execute_jobs(output: &mut dyn Write) -> io::Result<()> {
-    reap_completed_jobs(output)?;
-
     let mut jobs = jobs().lock().expect("job list mutex should not be poisoned");
+    refresh_job_statuses(&mut jobs)?;
 
     for (index, job) in jobs.iter().enumerate() {
         writeln!(
