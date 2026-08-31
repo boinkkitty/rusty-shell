@@ -1,7 +1,6 @@
 mod command;
 mod repl;
 mod parser;
-mod repl;
 mod shell;
 
 fn main() {
