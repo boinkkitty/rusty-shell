@@ -66,6 +66,14 @@ The shell also launches external programs found through `PATH`, passing parsed a
 
 **Mimics a real shell:** `declare NAME=value` stores a shell variable, and `$NAME` or `${NAME}` expands it in builtin and external-command arguments. Missing variables expand to an empty string, and `$` inside single quotes remains literal.
 
+```sh
+declare greeting=hello
+echo "$greeting world"
+echo '${greeting}'
+```
+
+The first command prints `hello world`; the second prints the literal text `${greeting}`. Braced names can be embedded next to text, for example `${greeting}_id`.
+
 **Implementation support:** A mutex-protected Rust `HashMap` stores variables. The parser marks single-quoted dollar signs with a private sentinel so expansion can distinguish literal `$` from expandable parameter syntax.
 
 **Does not yet mimic:** Variables are shell-local and are not exported to child processes. There is no positional parameter support, `$?`, command substitution, default-value syntax, special parameters, or expansion field splitting. An argument that expands to an empty string is removed rather than preserved as an empty argument.
