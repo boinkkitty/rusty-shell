@@ -1,6 +1,6 @@
 # rusty-shell
 
-`rusty-shell` is a small Unix shell written in Rust. It provides an interactive prompt, a focused set of built-in commands, executable discovery through `PATH`, shell-style quoting and escaping, and output redirection for both built-ins and external programs.
+`rusty-shell` is a small Unix shell written in Rust. It is an educational implementation of common Unix shell behavior, not a POSIX-compatible replacement for `sh`, `bash`, or `zsh`.
 
 ## Requirements
 
@@ -23,7 +23,9 @@ $ pwd
 $ exit
 ```
 
-## Built-in commands
+## Command reference
+
+Built-ins execute inside the shell process unless they are placed in a pipeline, where they run through the `--pipeline-builtin` helper mode. This mirrors the real-shell rule that stateful commands such as `cd` must affect the current shell, while allowing pipeline stages to have independent standard streams.
 
 | Command | Description | Example |
 | --- | --- | --- |
@@ -34,6 +36,70 @@ $ exit
 | `pwd` | Prints the current working directory. | `pwd` |
 | `cd <directory>` | Changes the current working directory. `cd ~` uses `HOME`. | `cd /tmp` |
 | `exit` | Exits the shell. | `exit` |
+
+The shell also launches external programs found through `PATH`, passing parsed arguments to them without reimplementing their functionality.
+
+## Feature behavior
+
+### Built-ins and external commands
+
+**Mimics a real shell:** Built-ins are dispatched without spawning a process, external commands are resolved through `PATH`, `type` distinguishes built-ins from executables, and `cd` changes the shell's working directory.
+
+**Implementation support:** Rust's `std::process::Command`, `std::env`, filesystem metadata APIs, and Unix permission APIs provide process launching, environment lookup, executable discovery, and directory changes.
+
+**Does not yet mimic:** Command lookup does not implement shell functions, aliases, hashed command tables, login startup files, or command precedence beyond this small built-in registry. Error messages and `cd` argument handling are simplified.
+
+**Future work:** Add a structured command-resolution layer with aliases/functions, `CDPATH`, `OLDPWD`/`PWD`, shell startup configuration, and shell-compatible diagnostics.
+
+### Parsing, quoting, and escaping
+
+**Mimics a real shell:** Unquoted whitespace separates arguments; single quotes preserve literal text; double quotes preserve whitespace while recognizing escaped quotes and backslashes; adjacent quoted and unquoted text forms one argument; and an unquoted backslash escapes the next character.
+
+**Implementation support:** `src/parser.rs` uses a small state machine with explicit quote modes, redirect state, and pipeline-stage state. This keeps parsing independent from process execution and makes the grammar directly testable.
+
+**Does not yet mimic:** There is no variable expansion, globbing, command substitution, arithmetic expansion, here-documents, subshell syntax, comments, or full error reporting for unterminated quotes and malformed commands.
+
+**Future work:** Introduce a tokenization and expansion phase before parsing into an execution AST, report syntax locations, and add expansion ordering compatible with POSIX shells.
+
+### Pipelines
+
+**Mimics a real shell:** `cmd1 | cmd2 | cmd3` connects each process's standard output to the next process's standard input. Any number of stages is supported, external processes stream concurrently, and built-ins can occupy pipeline positions.
+
+**Implementation support:** Rust `ChildStdout`, `Stdio::piped`, and `std::process::Command` connect stages. Built-ins in pipelines are relaunched with `--pipeline-builtin` so their output can be piped without changing the parent shell state.
+
+**Does not yet mimic:** Pipeline exit status is not propagated as `$?` or `pipefail`; signals, job control, process groups, and terminal ownership are not managed as a group; and pipeline-level background execution is limited.
+
+**Future work:** Add process groups and `waitpid`-style status collection, expose exit statuses, implement `pipefail`, and handle signals and terminal control correctly.
+
+### Redirection
+
+**Mimics a real shell:** `>`, `>>`, `1>`, `1>>`, `2>`, and `2>>` redirect standard output or standard error, with overwrite and append behavior. Redirection applies to built-ins and external commands, and quoted paths are supported.
+
+**Implementation support:** `OpenOptions` opens files with create, truncate, or append modes; `Stdio::from` attaches them to child processes; built-ins write through an output writer selected at execution time.
+
+**Does not yet mimic:** Input redirection (`<`), file-descriptor duplication (`2>&1`), descriptor closing, multiple ordered redirections, and heredocs are not implemented. Redirection errors use Rust I/O errors rather than shell-compatible diagnostics.
+
+**Future work:** Represent redirections as ordered operations, support arbitrary file descriptors and descriptor duplication, and apply them with `dup2` semantics before executing each command.
+
+### Background jobs
+
+**Mimics a real shell:** Appending `&` starts an external command asynchronously, returns a prompt immediately, assigns a job number, and exposes status through `jobs`. Completed jobs are reaped before a prompt and job numbers are reused.
+
+**Implementation support:** `Child::spawn`, `Child::try_wait`, a mutex-protected job table, and explicit job-status refresh provide asynchronous tracking without blocking the shell loop.
+
+**Does not yet mimic:** There are no process groups, foreground/background control, `fg`/`bg`, `wait`, job-spec syntax, signal forwarding, terminal ownership, or robust shutdown cleanup. Background built-ins are not independently scheduled.
+
+**Future work:** Use Unix process groups, implement `SIGCHLD`-driven status updates, add `wait`/`fg`/`bg`, and make Ctrl-C/Ctrl-Z affect the foreground job rather than the shell.
+
+### Interactive completion and history
+
+**Mimics a real shell:** Interactive input supports line editing, command-name completion, completion candidate listing, Ctrl-C interruption, Ctrl-D at an empty prompt, and history navigation. Unique completion adds a trailing space; ambiguous completion leaves candidates suitable for further completion.
+
+**Implementation support:** The `rustyline` crate provides terminal editing, readline history, completion hooks, and interruption handling. `src/repl.rs` adapts it to this shell, while `src/command.rs` supplies built-in and executable candidates.
+
+**Does not yet mimic:** Completion only covers the command position, not arguments or filesystem paths. The `history` builtin is session-memory-only, while `rustyline` history is used for interactive navigation; there is no persistent history file, reverse search, or shell history expansion.
+
+**Future work:** Complete paths and arguments contextually, add persistent history and configurable history files, support reverse search, and share one history backend between the builtin and readline editor.
 
 ## External programs
 
@@ -46,53 +112,6 @@ $ printf '<%s>\n' first second
 ```
 
 The child process inherits the terminal unless its output is redirected.
-
-## Pipelines
-
-Use `|` to connect the standard output of one command to the standard input of the next. Pipelines may contain any number of stages, and built-ins can participate in any stage:
-
-```text
-$ cat output.txt | grep second | wc -l
-1
-$ echo hello | type exit
-exit is a shell builtin
-```
-
-Pipeline built-ins run in an isolated shell process, so state-changing commands in a pipeline do not affect the parent shell.
-
-## Interactive completion
-
-When `stdin` is a terminal, pressing `Tab` attempts to complete the command name before the first argument.
-
-- A unique match inserts the remaining text and a trailing space.
-- Multiple matches extend to the longest shared prefix when possible.
-- If the prefix is still ambiguous, the first `Tab` rings the terminal bell and a second `Tab` prints the sorted matches.
-
-Completion candidates currently include:
-
-- Built-in commands `echo` and `exit`
-- Executable file names discovered in `PATH`
-
-Completion is limited to the command position. It does not complete arguments, file paths, or later built-ins like `cd`, `pwd`, or `type`.
-
-Unique completions insert a trailing space so the next token can be typed immediately. Ambiguous completion candidates are inserted without a trailing space, allowing the completion list to continue narrowing correctly.
-
-The interactive editor is implemented with `rustyline`, which centralizes terminal input, completion, history handling, and line editing instead of maintaining a separate raw-terminal reader.
-
-Command history is also recorded in memory and can be inspected with `history`. Interactive line editing maintains its own readline history for navigation and completion.
-
-## Background jobs
-
-Append `&` to an external command to run it in the background. The shell prints a job number and process ID, then immediately displays the next prompt:
-
-```text
-$ sleep 10 &
-[1] 12345
-$ jobs
-[1]+  Running                 sleep 10 &
-```
-
-Completed jobs are reported before the next prompt and removed from the job list. Job numbers are reused after completed jobs are reaped.
 
 ## Quoting and escaping
 
