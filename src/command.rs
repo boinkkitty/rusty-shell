@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -12,8 +12,14 @@ use std::sync::{Mutex, OnceLock};
 use crate::parser::{CommandStage, ParsedCommand, RedirectTarget};
 
 static JOBS: OnceLock<Mutex<Vec<Job>>> = OnceLock::new();
-static HISTORY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static HISTORY: OnceLock<Mutex<HistoryState>> = OnceLock::new();
 const BUILTIN_NAMES: &[&str] = &["echo", "exit", "type", "jobs", "history", "pwd", "cd"];
+
+#[derive(Default)]
+struct HistoryState {
+    entries: Vec<String>,
+    append_cursor: usize,
+}
 
 struct Job {
     number: usize,
@@ -67,11 +73,34 @@ pub fn record_history(command: &str) {
     history()
         .lock()
         .expect("history mutex should not be poisoned")
+        .entries
         .push(trimmed.to_owned());
 }
 
 pub fn builtin_names() -> &'static [&'static str] {
     BUILTIN_NAMES
+}
+
+pub fn load_histfile(path: &Path) -> io::Result<()> {
+    let mut history = history()
+        .lock()
+        .expect("history mutex should not be poisoned");
+
+    if !path.exists() {
+        history.append_cursor = history.entries.len();
+        return Ok(());
+    }
+
+    read_history_file(&mut history, path)?;
+    history.append_cursor = history.entries.len();
+    Ok(())
+}
+
+pub fn flush_histfile(path: &Path) -> io::Result<()> {
+    let mut history = history()
+        .lock()
+        .expect("history mutex should not be poisoned");
+    append_history_file(&mut history, path)
 }
 
 fn execute_stage(stage: &CommandStage, run_in_background: bool) -> io::Result<CommandOutcome> {
@@ -386,24 +415,69 @@ fn jobs() -> &'static Mutex<Vec<Job>> {
     JOBS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn history() -> &'static Mutex<Vec<String>> {
-    HISTORY.get_or_init(|| Mutex::new(Vec::new()))
+fn history() -> &'static Mutex<HistoryState> {
+    HISTORY.get_or_init(|| Mutex::new(HistoryState::default()))
 }
 
 fn execute_history(arguments: &[String], output: &mut dyn Write) -> io::Result<()> {
-    let history = history()
+    let mut history = history()
         .lock()
         .expect("history mutex should not be poisoned");
+
+    match arguments {
+        [flag, path] if flag == "-r" => {
+            read_history_file(&mut history, Path::new(path))?;
+            return Ok(());
+        }
+        [flag, path] if flag == "-w" => {
+            write_history_file(&history, Path::new(path))?;
+            return Ok(());
+        }
+        [flag, path] if flag == "-a" => {
+            append_history_file(&mut history, Path::new(path))?;
+            return Ok(());
+        }
+        _ => {}
+    }
 
     let start = arguments
         .first()
         .and_then(|argument| argument.parse::<usize>().ok())
-        .map_or(0, |count| history.len().saturating_sub(count));
+        .map_or(0, |count| history.entries.len().saturating_sub(count));
 
-    for (index, command) in history.iter().enumerate().skip(start) {
+    for (index, command) in history.entries.iter().enumerate().skip(start) {
         writeln!(output, "{:>5}  {}", index + 1, command)?;
     }
 
+    Ok(())
+}
+
+fn read_history_file(history: &mut HistoryState, path: &Path) -> io::Result<()> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            history.entries.push(line);
+        }
+    }
+
+    Ok(())
+}
+
+fn write_history_file(history: &HistoryState, path: &Path) -> io::Result<()> {
+    fs::write(path, history.entries.join("\n") + "\n")
+}
+
+fn append_history_file(history: &mut HistoryState, path: &Path) -> io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    for command in &history.entries[history.append_cursor..] {
+        writeln!(file, "{command}")?;
+    }
+
+    history.append_cursor = history.entries.len();
     Ok(())
 }
 

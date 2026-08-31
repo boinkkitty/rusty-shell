@@ -65,6 +65,34 @@ fn run_shell_output_with_path(input: &str, path: &str) -> ShellOutput {
     }
 }
 
+fn run_shell_output_with_env(input: &str, environment: &[(&str, &str)]) -> ShellOutput {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusty_shell"));
+    child
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for (key, value) in environment {
+        child.env(key, value);
+    }
+
+    let mut child = child.spawn().expect("shell binary should start");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(input.as_bytes())
+        .expect("test input should be written");
+
+    let output = child.wait_with_output().expect("shell should exit");
+    assert!(output.status.success());
+    ShellOutput {
+        stdout: String::from_utf8(output.stdout).expect("shell stdout should be UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("shell stderr should be UTF-8"),
+    }
+}
+
 fn temporary_bin(name: &str, mappings: &[(&str, &str)]) -> PathBuf {
     let directory = temporary_path(name);
     let _ = fs::remove_dir_all(&directory);
@@ -211,6 +239,121 @@ fn history_with_a_limit_shows_only_the_last_n_commands() {
         "$ hello\n$ world\n$ $     3  invalid_command\n    4  history 2\n$ "
     );
     assert_eq!(output.stderr, "invalid_command: command not found\n");
+}
+
+#[test]
+fn history_read_appends_commands_from_a_file() {
+    let history_path = temporary_file("history-read", "echo hello\necho world\n\n");
+    let output = run_shell_output(&format!(
+        "history -r {}\nhistory\nexit\n",
+        history_path.display()
+    ));
+
+    assert_eq!(
+        output.stdout,
+        format!(
+            "$ $     1  history -r {}\n    2  echo hello\n    3  echo world\n    4  history\n$ ",
+            history_path.display()
+        )
+    );
+    assert_eq!(output.stderr, "");
+
+    fs::remove_file(history_path).expect("temporary history file should be removed");
+}
+
+#[test]
+fn history_write_persists_in_memory_commands_to_a_file() {
+    let history_path = temporary_path("history-write");
+    let output = run_shell_output(&format!(
+        "echo hello\necho world\nhistory -w {}\nexit\n",
+        history_path.display()
+    ));
+
+    assert_eq!(output.stdout, "$ hello\n$ world\n$ $ ");
+    assert_eq!(output.stderr, "");
+    assert_eq!(
+        fs::read_to_string(&history_path).expect("written history file should be readable"),
+        format!(
+            "echo hello\necho world\nhistory -w {}\n",
+            history_path.display()
+        )
+    );
+
+    fs::remove_file(history_path).expect("temporary history file should be removed");
+}
+
+#[test]
+fn history_append_writes_only_commands_since_the_last_append() {
+    let history_path = temporary_file("history-append", "echo initial_command_1\necho initial_command_2\n");
+    let output = run_shell_output(&format!(
+        "echo new_command\nhistory -a {}\nhistory -a {}\nexit\n",
+        history_path.display(),
+        history_path.display()
+    ));
+
+    assert_eq!(output.stdout, "$ new_command\n$ $ $ ");
+    assert_eq!(output.stderr, "");
+    assert_eq!(
+        fs::read_to_string(&history_path).expect("appended history file should be readable"),
+        format!(
+            "echo initial_command_1\necho initial_command_2\necho new_command\nhistory -a {}\nhistory -a {}\n",
+            history_path.display(),
+            history_path.display()
+        )
+    );
+
+    fs::remove_file(history_path).expect("temporary history file should be removed");
+}
+
+#[test]
+fn history_loads_from_histfile_on_startup() {
+    let history_path = temporary_file("histfile-startup", "echo hello\necho world\n");
+    let histfile = history_path.display().to_string();
+    let output = run_shell_output_with_env("history\nexit\n", &[("HISTFILE", &histfile)]);
+
+    assert_eq!(
+        output.stdout,
+        "$     1  echo hello\n    2  echo world\n    3  history\n$ "
+    );
+    assert_eq!(output.stderr, "");
+
+    fs::remove_file(history_path).expect("temporary history file should be removed");
+}
+
+#[test]
+fn history_appends_session_commands_to_histfile_on_exit() {
+    let history_path = temporary_path("histfile-exit-write");
+    let histfile = history_path.display().to_string();
+    let output = run_shell_output_with_env(
+        "echo hello\necho world\nexit\n",
+        &[("HISTFILE", &histfile)],
+    );
+
+    assert_eq!(output.stdout, "$ hello\n$ world\n$ ");
+    assert_eq!(output.stderr, "");
+    assert_eq!(
+        fs::read_to_string(&history_path).expect("history file should be readable"),
+        "echo hello\necho world\nexit\n"
+    );
+
+    fs::remove_file(history_path).expect("temporary history file should be removed");
+}
+
+#[test]
+fn history_appends_new_session_commands_to_existing_histfile_on_exit() {
+    let history_path =
+        temporary_file("histfile-exit-append", "echo initial_command_1\necho initial_command_2\n");
+    let histfile = history_path.display().to_string();
+    let output = run_shell_output_with_env("echo new_command\nexit\n", &[("HISTFILE", &histfile)]);
+
+    assert_eq!(output.stdout, "$ new_command\n$ ");
+    assert_eq!(output.stderr, "");
+    assert_eq!(
+        fs::read_to_string(&history_path).expect("history file should be readable"),
+        "echo initial_command_1\necho initial_command_2\necho new_command\nexit\n"
+    );
+
+    fs::remove_file(history_path).expect("temporary history file should be removed");
 }
 
 #[test]

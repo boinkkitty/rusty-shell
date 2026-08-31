@@ -1,4 +1,6 @@
+use std::env;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 
 use crate::command::{self, CommandOutcome};
 use crate::parser::parse_command_line;
@@ -38,6 +40,11 @@ fn normalize_terminal_newlines(output: &[u8]) -> Vec<u8> {
 pub fn run() -> io::Result<()> {
     let interactive = io::stdin().is_terminal();
     let mut editor = interactive.then(ShellEditor::new).transpose()?;
+    let histfile = env::var_os("HISTFILE").map(PathBuf::from);
+
+    if let Some(path) = histfile.as_deref() {
+        command::load_histfile(path)?;
+    }
 
     loop {
         let input = if let Some(editor) = editor.as_mut() {
@@ -54,6 +61,9 @@ pub fn run() -> io::Result<()> {
         };
 
         let Some(input) = input else {
+            if let Some(path) = histfile.as_deref() {
+                command::flush_histfile(path)?;
+            }
             return Ok(());
         };
 
@@ -61,7 +71,12 @@ pub fn run() -> io::Result<()> {
         let command = parse_command_line(&input);
 
         match command::execute(&command) {
-            Ok(CommandOutcome::Exit) => return Ok(()),
+            Ok(CommandOutcome::Exit) => {
+                if let Some(path) = histfile.as_deref() {
+                    command::flush_histfile(path)?;
+                }
+                return Ok(());
+            }
             Ok(CommandOutcome::Continue) => {}
             Err(error) => eprintln!("shell: {error}"),
         }
