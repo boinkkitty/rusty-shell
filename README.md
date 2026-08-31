@@ -97,9 +97,9 @@ The shell also launches external programs found through `PATH`, passing parsed a
 
 **Implementation support:** The `rustyline` crate provides terminal editing, readline history, completion hooks, and interruption handling. `src/repl.rs` adapts it to this shell, while `src/command.rs` supplies built-in and executable candidates.
 
-**Does not yet mimic:** Completion only covers the command position, not arguments or filesystem paths. The `history` builtin is session-memory-only, while `rustyline` history is used for interactive navigation; there is no persistent history file, reverse search, or shell history expansion.
+**Does not yet mimic:** Completion only covers the command position, not arguments or filesystem paths. The `history` builtin supports in-memory history plus `history -r file`, `history -w file`, and `history -a file`; setting `HISTFILE` loads history at startup and appends the current session on exit. Reverse search and shell history expansion are not implemented.
 
-**Future work:** Complete paths and arguments contextually, add persistent history and configurable history files, support reverse search, and share one history backend between the builtin and readline editor.
+**Future work:** Complete paths and arguments contextually, support reverse search and history expansion, and share one history backend between the `history` builtin and readline editor.
 
 ## External programs
 
