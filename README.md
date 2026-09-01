@@ -216,3 +216,80 @@ The test suite covers built-ins, executable lookup, command-name completion incl
 ## Current scope
 
 This project intentionally implements a focused subset of shell behavior. Wildcard expansion, command substitution, input redirection, argument/path completion, exported variables, and compound commands are not currently supported.
+
+## Feature Status
+
+| Feature | Status | Current implementation | Real-shell behaviour still missing |
+| --- | --- | --- | --- |
+| Navigation | Partial | `pwd`, `cd`, and `cd ~` in the parent shell | `CDPATH`, `cd -`, directory stacks, logical/physical modes, `PWD` and `OLDPWD` |
+| Quoting and escaping | Partial | Single/double quotes, unquoted backslash escapes, adjacent quoted segments | Full grammar, comments, multiline/error handling, expansion-aware context |
+| Redirection | Partial | stdout/stderr overwrite and append using `>`, `>>`, `1>`, `1>>`, `2>`, `2>>` | `<`, descriptor duplication/closing, ordering, arbitrary descriptors, heredocs |
+| Command completion | Partial | Builtin and executable names from `PATH` via `rustyline` | Argument-aware, option-aware, file/directory, and programmable completion |
+| File/path completion | Not implemented | No file or directory candidate provider | File, directory, tilde, glob, and context-aware path completion |
+| Programmable completion | Not implemented | No completion functions or scripts | Bash/Zsh completion functions and context-aware candidates |
+| Background jobs | Partial | Async external commands, IDs, `jobs`, prompt-time reaping | Process groups, `fg`, `bg`, `wait`, signals, terminal control, pipeline jobs |
+| Pipelines | Partial | Any number of stages, builtin stages, streaming pipes | Pipeline status, `pipefail`, process groups, signals, background pipelines |
+| Command history | Partial | In-memory `history`, numeric suffix, `-r/-w/-a` | Reverse search, history expansion, shared editor backend, policy controls |
+| History persistence | Partial | `HISTFILE` startup read and session append on exit/EOF | Concurrent-session locking/merging, atomic writes, deduplication, limits |
+| Parameter expansion | Partial | `$NAME` and `${NAME}` from shell-local `declare` variables | `$?`, positional/special parameters, word splitting, globbing, command substitution |
+
+## Comparison With Bash and Zsh
+
+`rusty-shell` follows the shape of a Unix shell but implements a deliberately narrow subset.
+
+| Area | `rusty-shell` | Bash/Zsh comparison |
+| --- | --- | --- |
+| Grammar | Words, quotes, redirects, `|`, and trailing `&` | Lists, conditionals, functions, loops, subshells, comments, and richer diagnostics are missing |
+| Quotes and escaping | Common single/double quote and backslash cases | Simple examples are similar; edge cases and expansion context are incomplete |
+| Expansion | `$NAME` and `${NAME}` only | Bash/Zsh also perform ordered tilde, command, arithmetic, splitting, globbing, and `$?` expansion |
+| Word splitting/globbing | Not implemented | Core post-expansion behavior |
+| Redirection | stdout/stderr overwrite and append | Missing input, descriptor duplication/closing, ordering, and heredocs |
+| Pipelines | Multi-stage streaming, including builtins | Missing pipeline status, `pipefail`, process groups, and terminal semantics |
+| Jobs | In-memory IDs, `jobs`, polling | Bash/Zsh provide `fg`, `bg`, `wait`, notifications, process groups, and terminal ownership |
+| Signals | Readline interruption only | Bash/Zsh coordinate signals across foreground process groups |
+| Completion | Builtin/executable command names from `PATH` | Bash/Zsh also support file, directory, option, argument, and programmable completion |
+| History | Memory, explicit file operations, optional `HISTFILE` | Richer search, expansion, limits, configuration, locking, and concurrent-session handling |
+
+Parsing a syntax token is not evidence that its complete Bash/Zsh runtime semantics are implemented.
+
+## Roadmap
+
+### Shell correctness
+
+1. Build a quote-aware token and AST pipeline with correct expansion ordering.
+2. Add exit statuses, `$?`, pipeline status rules, and optional `pipefail`.
+3. Implement input redirection, ordered descriptor operations, duplication, closing, and heredocs.
+4. Add process groups, `fg`, `bg`, `wait`, signal forwarding, and terminal ownership.
+5. Add lists, conditionals, subshells, command substitution, globbing, word splitting, positional parameters, and exported variables.
+6. Make history persistence safe for concurrent sessions with locking, atomic writes, limits, and deduplication.
+
+### Completion and quality of life
+
+1. Add file and directory completion for relative paths, absolute paths, `~`, quoting, and filtering.
+2. Add programmable/context-aware completion for options, arguments, descriptions, and user-provided functions.
+3. Add reverse history search, history expansion, aliases, startup files, and configurable editor behavior.
+4. Add command lookup caching, incremental completion indexes, bounded history storage, and event-driven job notifications.
+
+## Architecture
+
+1. `src/shell.rs` selects terminal input through `repl::ShellEditor` or line reads for non-interactive input.
+2. `src/repl.rs` configures `rustyline` editing, command-name completion, Ctrl-C/Ctrl-D handling, and readline history.
+3. `src/parser.rs` scans quote, redirection, and pipeline state into `ParsedCommand` and `CommandStage` values, marking trailing `&` and literal single-quoted dollar signs.
+4. `src/command.rs` records history, expands shell-local variables, opens redirection files, and dispatches builtins, external programs, pipelines, or background jobs.
+5. Pipelines connect `ChildStdout` to the next process with `Stdio::piped`; builtin stages re-enter `src/main.rs` with `--pipeline-builtin`.
+6. Jobs use `Mutex`, `OnceLock`, and `Child::try_wait`; `HISTFILE` persistence reads and appends line-oriented history files.
+
+## Running and Testing
+
+The crate requires a Unix-like operating system and Rust 1.96 or newer. Its package name is `rusty_shell`.
+
+```sh
+cargo run
+cargo test --locked
+```
+
+The tests cover all registered builtins, navigation, quoting, escaping, redirection, command-name completion, parameter expansion, pipelines, background jobs, session history, and `HISTFILE` persistence. The Codecrafters entrypoint is also available:
+
+```sh
+./your_program.sh
+```
